@@ -103,7 +103,7 @@ train:
   grad_clip_norm: 1.0
   eval_interval: 1293
   eval_iters: 50
-  log_interval: 50
+  log_interval: 2000
   checkpoint_interval: 1293
   use_amp: true
   seed: 1337
