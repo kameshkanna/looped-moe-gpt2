@@ -18,6 +18,24 @@
 #
 # Measured on this project's RTX 4060: ~309ms/microbatch at batch_size=8, ~5.8GB peak VRAM,
 # ~13.2k tokens/sec, ~35.6 hours (~1.5 days) total for 103,454 steps.
+#
+# RESCALED FOR H100 SXM (80GB) -- see docs/runpod_h100_setup.md and scripts/profile_batch_size.py.
+# Empirical sweep on the actual H100 found throughput plateaus around batch_size=64: bs=96 was
+# a real regression (278.5k tok/s, WORSE than bs=64's 299.0k) and bs=128 only edged out bs=64 by
+# ~2% (305.3k tok/s) while using ~2x the VRAM (58.6GB vs 30.0GB) -- not worth the reduced safety
+# margin on an unattended run given the ~2% gain is within likely measurement noise (the sweep's
+# own torch.compile cache behavior was inconsistent across candidates: bs=64 recompiled in 0.4s,
+# bs=96/128 took 27-30s, suggesting cache-state differences confound a clean comparison at the
+# high end). Chose batch_size=64, grad_accum=1 (effective batch 64, double the original 32) for
+# the best throughput-per-VRAM tradeoff: ~109.6ms/microbatch, ~299k tokens/sec, ~30GB peak
+# (real training will use somewhat more via dataloader buffers -- 30GB leaves 50GB of headroom
+# on an 80GB card, vs. bs=128's 58.6GB leaving only ~21GB). Effective batch doubling from 32->64
+# also means max_steps roughly halves (103454->51727) for the same 1.695B-token budget, and
+# learning_rate/min_learning_rate were scaled by sqrt(64/32)=1.414 per standard AdamW batch-size
+# scaling practice (3.0e-4 -> 4.24e-4). warmup_steps/eval_interval/checkpoint_interval and the
+# curriculum's start_step/ramp_steps were all rescaled proportionally to the new max_steps --
+# see the values below, not the comment in the (now superseded) 4060 estimate above.
+# Estimated H100 total training time: ~1.57 hours (94 min) for the full 51,727-step run.
 model:
   vocab_size: 50257
   hidden_size: 1024
@@ -70,29 +88,29 @@ train:
     - name: math
       train_bin_path: data/math_train.bin
       val_bin_path: data/math_val.bin
-      start_step: 25863   # 25% of max_steps
-      ramp_steps: 20690   # 20% of max_steps -- math reaches full weight at step 46553 (45%)
+      start_step: 12932   # 25% of max_steps (51727)
+      ramp_steps: 10345   # 20% of max_steps -- math reaches full weight at step 23277 (45%)
       target_weight: 1.0  # equal weight with general once fully ramped in (50/50 blend)
-  batch_size: 8
-  gradient_accumulation_steps: 4
-  max_steps: 103454
-  learning_rate: 3.0e-4
-  min_learning_rate: 3.0e-5
-  warmup_steps: 1034
+  batch_size: 64
+  gradient_accumulation_steps: 1
+  max_steps: 51727
+  learning_rate: 4.24e-4
+  min_learning_rate: 4.24e-5
+  warmup_steps: 517
   weight_decay: 0.1
   beta1: 0.9
   beta2: 0.95
   grad_clip_norm: 1.0
-  eval_interval: 2586
+  eval_interval: 1293
   eval_iters: 50
   log_interval: 50
-  checkpoint_interval: 2586
+  checkpoint_interval: 1293
   use_amp: true
   seed: 1337
   # Verified working (correct training dynamics, genuine per-token router variation preserved,
-  # checkpoints save/load correctly) at this exact architecture. Combined with fused AdamW
-  # (Trainer._build_optimizer applies this automatically on CUDA), measured throughput went
-  # from ~314.7ms -> ~186.0ms/microbatch -- roughly 40% faster overall, taking the estimated
-  # total run time from ~35.6 hours down to ~21.4 hours. One-time ~149s compile cost on the
-  # first step is negligible against the full run length.
+  # checkpoints save/load correctly) at this exact architecture, on both the RTX 4060 (bs=8) and
+  # H100 SXM (bs=64, via scripts/profile_batch_size.py -- see the RESCALED comment above). Combined
+  # with fused AdamW (Trainer._build_optimizer applies this automatically on CUDA). One-time
+  # compile cost (~20-30s on H100 at bs=64, per the profiling sweep) is negligible against the
+  # full run length.
   compile_model: true
