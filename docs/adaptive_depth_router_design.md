@@ -19,6 +19,77 @@ turning this into a real inference-time test-time-compute knob rather than a res
 diagnostic. Currently requires `SharingPattern.FULL_LOOP` (Middle-Cycle + router-gating
 interaction remains an open question, as originally noted below).
 
+## Empirical finding: the router learns confidence-gating, not difficulty-gating (and structurally cannot do otherwise under `capacity_ratio`)
+
+**Setup:** `configs/06_deep_loop_diagnostic.yaml`, ~75.7M params, `num_loops=12`,
+`capacity_ratio=0.7`, `min_loops=1`, trained from scratch on ~46.7M tokens of FineWeb-Edu (2850
+steps, ~1h16m on an RTX 4060). This run exists specifically because an earlier check on the
+`num_loops=3` curriculum checkpoint (`configs/05_curriculum_reasoning.yaml`) was inconclusive —
+with only 2 non-degenerate exit points after `min_loops=1`, there wasn't enough dynamic range to
+tell a real signal from noise. `num_loops=12` gives 11 non-degenerate exit points.
+
+**Method:** for each of several checkpoints spanning the run, computed per-token cross-entropy
+loss (as an objective difficulty proxy — higher loss means the model finds that token harder to
+predict) against `last_exit_iteration` (which loop iteration each token actually stopped
+updating at) over the same 16-sequence, 512-token held-out validation batch (8,192 tokens),
+correlating the two.
+
+**Result:**
+
+| step | correlation (loss vs. exit depth) | mean exit depth |
+|---|---|---|
+| 71 | -0.041 | 3.29 |
+| 355 | -0.170 | 3.29 |
+| 710 | -0.202 | 3.29 |
+| 1420 | -0.206 | 3.29 |
+| 2130 | -0.210 | 3.29 |
+| 2850 (final) | -0.209 | 3.29 |
+
+Per-depth-bucket mean loss at the final checkpoint is a clean, near-monotonic decrease from
+depth 1 (loss 6.13, hardest) to depth 11 (loss 2.98, easiest) — this is not noisy scatter, it is
+a consistent trend across the full depth range.
+
+**Two findings, not one:**
+
+1. **The router learned the OPPOSITE of the intended "harder tokens get more compute" behavior.**
+   The correlation is negative and stable: tokens the model finds EASY (low loss) are the ones
+   that get routed DEEPER, not tokens it finds hard. This pattern is not present at
+   initialization (correlation ≈ 0 at step 71) — it emerges within the first ~25% of training and
+   then holds essentially constant for the rest of the run. A plausible mechanism: a token the
+   model is already confident/correct about may genuinely benefit from further refinement passes
+   through the shared block (there is "useful work" left to do that improves an already-good
+   prediction), while a token the model is fundamentally uncertain about (rare word, genuinely
+   ambiguous continuation) may not be resolved by more passes of the SAME shared computation —
+   so a loss-minimizing router learns to stop investing in those tokens rather than "try harder."
+   This is closer to how confidence-based early-exit classifiers are usually framed in other
+   literature than to MoR's "adaptive reasoning depth" framing this project set out to test.
+
+2. **The mean exit depth (3.29) is IDENTICAL across every checkpoint checked, to two decimal
+   places** — this is not because training stabilized on that number, it is a direct, forced
+   consequence of the masked-dense router's own mechanism (see `router.py`): at every iteration,
+   the top `capacity_ratio` FRACTION of currently-active tokens survive, regardless of what the
+   router has or hasn't learned. With `capacity_ratio=0.7`, the survivor fraction after `n`
+   iterations past `min_loops` is deterministically `0.7^n` (100% -> 70% -> 49% -> 34.3% -> ...),
+   which sets the exit-depth DISTRIBUTION's shape independent of training. **What the router
+   actually learns is only WHICH tokens (by relative score) occupy that fixed-size survivor
+   pool at each cutoff — never HOW MANY survive, and never the total compute budget.** This is
+   an architectural ceiling, not a training artifact: as designed, this router cannot express
+   "this problem is harder, so spend more total depth on it than that other problem" -- it can
+   only reallocate a fixed depth budget across tokens within one input. A design that wanted
+   genuine total-compute scaling with difficulty would need a different mechanism (e.g. a
+   per-SEQUENCE rather than per-token capacity signal, or removing the fixed-ratio cutoff in
+   favor of a learned per-token halting probability threshold, closer to the original Universal
+   Transformer ACT mechanism this whole lineage descends from).
+
+**Implication for `docs/literature_survey.md`'s framing**: the "does adaptive depth help
+reasoning" question this router was built to test is still open, but this finding narrows it —
+before asking whether the LEARNED routing helps, note that the CAPACITY-RATIO mechanism itself
+bounds what kind of adaptivity is even representable. Any future ablation of this router should
+control for `capacity_ratio`'s fixed-shape effect explicitly, and a next design iteration should
+consider whether a per-token halting-probability mechanism (no fixed survivor fraction) would
+let genuine difficulty-driven depth-scaling emerge, if it exists to be learned at this scale at
+all.
+
 ## What this adds, precisely
 
 Today, `LoopConfig.num_loops` is a fixed integer baked into the model at construction time
