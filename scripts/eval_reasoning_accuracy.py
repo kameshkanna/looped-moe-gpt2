@@ -38,8 +38,13 @@ from looped_moe_gpt2.utils.hub import resolve_checkpoint_and_config
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger(__name__)
 
-_GSM8K_ANSWER_PATTERN = re.compile(r"####\s*(-?[\d,]+(?:\.\d+)?)")
-_GENERIC_NUMBER_PATTERN = re.compile(r"-?[\d,]+(?:\.\d+)?")
+# NOTE: the number body is `\d[\d,]*` (must START with a digit), not `[\d,]+` (one-or-more of
+# "digit OR comma") -- the latter lets a bare comma with zero actual digits match on its own
+# (e.g. "a, b, c" matches "," ), which then fails `float(",")` after stripping commas. Found via
+# a real crash on a live model generation during GSM8K eval, not caught by the original unit
+# tests (none of which happened to contain a comma with no adjacent digits).
+_GSM8K_ANSWER_PATTERN = re.compile(r"####\s*(-?\d[\d,]*(?:\.\d+)?)")
+_GENERIC_NUMBER_PATTERN = re.compile(r"-?\d[\d,]*(?:\.\d+)?")
 
 
 def extract_gsm8k_ground_truth(answer_field: str) -> float | None:

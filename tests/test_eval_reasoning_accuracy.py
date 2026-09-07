@@ -48,6 +48,22 @@ def test_extract_model_answer_no_number_returns_none() -> None:
     assert extract_model_answer("I cannot solve this problem.") is None
 
 
+def test_extract_model_answer_bare_commas_do_not_crash() -> None:
+    """Regression test for a real crash hit during a live GSM8K eval run: the original regex
+    `[\\d,]+` matches one-or-more of "digit OR comma", so a bare comma with zero actual digits
+    (e.g. free-form model text like "a, b, c") matched as "," -- then `float(",")` (after
+    stripping commas, leaving an empty string) raised ValueError and crashed the whole eval run
+    partway through. The fixed pattern requires the match to START with an actual digit."""
+    assert extract_model_answer("a, b, c") is None
+    assert extract_model_answer(", , ,") is None
+    assert extract_model_answer("well, I think, the answer, is unclear") is None
+
+
+def test_extract_model_answer_comma_with_digits_still_works() -> None:
+    """The fix for bare commas must not break legitimate comma-formatted numbers."""
+    assert extract_model_answer("the total came to 1,234 dollars") == 1234.0
+
+
 def test_extract_model_answer_prefers_marker_over_fallback() -> None:
     """If both a '####' marker AND other numbers are present, the marker takes precedence --
     the marker is the model's explicit final-answer signal, not just any number mentioned."""
