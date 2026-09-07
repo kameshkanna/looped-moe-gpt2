@@ -10,6 +10,7 @@ dependencies = [
     "tiktoken>=0.7",
     "pyyaml>=6.0",
     "datasets>=2.19",
+    "huggingface_hub>=0.24",
     "wandb>=0.17; extra == 'logging'",
 ]
 
