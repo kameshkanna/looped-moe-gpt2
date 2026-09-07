@@ -90,6 +90,93 @@ consider whether a per-token halting-probability mechanism (no fixed survivor fr
 let genuine difficulty-driven depth-scaling emerge, if it exists to be learned at this scale at
 all.
 
+## Follow-up: ACT and PonderNet mechanisms, and a third empirical finding
+
+Motivated directly by the finding above, two alternative mechanisms without a fixed
+survivor-fraction ceiling were built and tested (`RouterConfig.mechanism="act"` /
+`"pondernet"`; see `src/looped_moe_gpt2/model/act_router.py` and `.../ponder_router.py`).
+
+**ACT (Graves 2016)** was built first, and building it surfaced a genuine, literature-confirmed
+limitation rather than a novel one: gradient for a token's halting decision only flows through
+the "remainder" weight at its OWN halting step, and that remainder term has **zero** dependency
+on that step's own halting-probability output (verified directly: isolating the ponder-cost
+loss's backward pass raised "does not require grad" for a router whose only observed role in a
+test batch was causing halting, never continuing tokens past it). This matches a documented
+property of vanilla ACT ("gradient for the cost of computation can only back-propagate through
+the last computational step, leading to a biased estimation of the gradient" — the reason the
+field moved to PonderNet). Kept in the codebase for reference; not recommended for further use.
+
+**PonderNet (Banino et al. 2021)** fixes ACT's gradient-bias problem by construction
+(`p_n = lambda_n * prod_{j<n}(1-lambda_j)`, so every step's lambda participates in every later
+p_n) — verified directly via a regression test
+(`test_pondernet_gradient_reaches_every_non_boundary_router`) that gradient genuinely reaches
+every router between the forced-`min_loops` floor and the forced-last-step ceiling. This is a
+real, confirmed fix, not just a change of mechanism.
+
+**But testing it (same protocol as the capacity-router diagnostic: `num_loops=12`,
+`configs/07_pondernet_diagnostic.yaml`, same architecture/data/budget as `06`) produced a THIRD
+distinct failure mode, not a success:**
+
+| step | correlation (loss vs. exit depth) | mean exit depth |
+|---|---|---|
+| 71 | -0.042 | 1.002 |
+| 355 | -0.037 | 1.004 |
+| 710 | +0.003 | 1.005 |
+| 1420 | +0.006 | 1.021 |
+| 2130 | +0.007 | 1.011 |
+| 2850 (final) | +0.001 | 1.017 |
+
+Mean exit depth collapsed to ~1.0 (the minimum possible, right at the `min_loops=1` floor) and
+stayed there for the entire run — correlation is near-zero throughout, but not because a real
+signal is obscured by noise; there is essentially no VARIANCE in exit depth to correlate with
+anything. This is the opposite failure mode from capacity routing (which distributed exits
+across the full 1-11 range, just with the wrong sign): PonderNet learned to always halt at the
+first opportunity.
+
+**Ruled out the obvious hypothesis before accepting this as fundamental**: checked whether the
+KL-regularization term was dominating the loss and forcing minimal depth. It was not — the
+ponder/KL cost was 0.13% of the task cross-entropy loss at the final checkpoint (0.0066 vs.
+5.076), nowhere near large enough to explain always-halt-immediately behavior on its own. The
+halting head's learned bias moved from its deliberately-conservative init (-2.0, chosen to avoid
+a DIFFERENT degenerate collapse — halting everything at initialization before anything is
+learned) to essentially 0, producing `lambda_1 ≈ 0.496` (a near-coin-flip) at the first real
+opportunity to halt — which, combined with the geometric `p_n` weighting, makes iteration 1 the
+single largest weight almost by construction once `lambda_1` sits near 0.5. Whether this is a
+genuine small-scale/short-training-budget optimization difficulty specific to PonderNet, or would
+resolve with different init/prior hyperparameters, was not resolved further (a natural next
+experiment, not run here — see "Open questions" below).
+
+**Net result across all three mechanisms tried**: capacity-routing showed real signal but with
+the wrong sign, bounded by a structural ceiling; ACT was gradient-broken for a well-documented
+reason and untestable as designed; PonderNet fixed the gradient problem but collapsed to
+minimum-depth at this scale/budget. None of the three produced the intended "genuine
+difficulty-driven adaptive depth" behavior in this project's testing. This line of investigation
+is closed for now (see project decision below) rather than pursued to a fourth mechanism or
+further hyperparameter search.
+
+## Open questions (not pursued further in this project)
+
+- Would PonderNet's collapse-to-minimum resolve with a less-conservative init bias (e.g. -0.5
+  instead of -2.0) or a `geometric_prior_lambda` favoring more depth (e.g. 0.1, expected ponder
+  ~10 steps instead of ~3.3)? Not tested.
+- Would either mechanism behave differently at a larger training budget (this project's
+  diagnostics all used ~46.7M tokens, deliberately small for fast iteration on a single
+  consumer GPU)? Plausible that both failure modes are budget-limited rather than fundamental,
+  but not verified.
+- Is the masked-dense "every token computed at every iteration" design itself part of the
+  problem (e.g. because the loss landscape doesn't reward precise halting timing when the
+  un-taken iterations' compute is happening regardless)? Untested; would require the
+  gather/scatter-dense conversion flagged as a prerequisite for real inference savings anyway
+  (see this doc's earlier "Current limitation" section).
+
+## Project decision (see git history around this commit)
+
+Given three real, well-evidenced findings and no successful demonstration of genuine
+difficulty-driven adaptive depth at this project's scale, further router-mechanism iteration was
+deliberately stopped in favor of redirecting effort toward the base looped-MoE architecture's own
+strengths (validated at 85M scale to beat matched-compute dense baselines -- see
+`docs/literature_survey.md`) rather than the adaptive-depth extension specifically.
+
 ## What this adds, precisely
 
 Today, `LoopConfig.num_loops` is a fixed integer baked into the model at construction time
