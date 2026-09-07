@@ -1,0 +1,77 @@
+# Variant 7: pondernet_diagnostic
+#
+# Follow-up to variant 06 (deep_loop_diagnostic, capacity-based router). Same architecture and
+# data, but router.mechanism="pondernet" instead of the default "capacity" -- testing whether a
+# mechanism that can actually express variable total compute per token (no fixed
+# survivor-fraction cutoff) produces a genuine difficulty-depth correlation, where variant 06's
+# capacity-based router could not (see docs/adaptive_depth_router_design.md's two "Empirical
+# finding" sections for the full context: 06 found confidence-gating instead of
+# difficulty-gating, AND found that mechanism structurally cannot express per-token total-compute
+# scaling regardless of what it learns).
+#
+# geometric_prior_lambda=0.3 encodes a prior belief of ~3.3 average ponder steps
+# (1/0.3), roughly centered in the num_loops=12 range -- gives the model room to route
+# meaningfully shallower OR deeper than the prior, rather than anchoring at either extreme.
+# ponder_cost_weight=0.01 matches the same starting value used for capacity_ratio's aux_loss_weight
+# in variant 06, for a roughly comparable regularization strength across the two comparisons.
+#
+# Same 75.7M architecture, same ~46.7M token budget, same ~2hr RTX 4060 estimate as variant 06.
+model:
+  vocab_size: 50257
+  hidden_size: 896
+  num_layers: 3
+  num_heads: 14
+  max_seq_len: 512
+  dropout: 0.1
+  position_encoding: decoupled_rope
+  tie_word_embeddings: true
+  seed: 1337
+  attention:
+    use_mla: true
+    kv_compression_dim: 64
+    q_compression_dim: 192
+    rope_head_dim: 32
+  moe:
+    enabled: true
+    num_routed_experts: 8
+    num_shared_experts: 1
+    top_k: 2
+    expert_intermediate_size: 576
+    bias_update_speed: 1.0e-3
+    bias_update_speed_decay_frac: 0.1
+  loop:
+    enabled: true
+    sharing_pattern: full_loop
+    num_loops: 12
+    num_unique_prefix_layers: 1
+    num_unique_suffix_layers: 1
+    use_iter_adaln: true
+    use_active_ratio_balancing: true
+    use_router_gating: true
+    router:
+      mechanism: pondernet
+      min_loops: 1
+      ponder_cost_weight: 0.01
+      geometric_prior_lambda: 0.3
+
+train:
+  train_bin_path: data/general_train.bin
+  val_bin_path: data/general_val.bin
+  output_dir: runs/07_pondernet_diagnostic
+  batch_size: 4
+  gradient_accumulation_steps: 8
+  max_steps: 2850
+  learning_rate: 3.0e-4
+  min_learning_rate: 3.0e-5
+  warmup_steps: 28
+  weight_decay: 0.1
+  beta1: 0.9
+  beta2: 0.95
+  grad_clip_norm: 1.0
+  eval_interval: 71
+  eval_iters: 30
+  log_interval: 100
+  checkpoint_interval: 71
+  use_amp: true
+  seed: 1337
+  compile_model: true
