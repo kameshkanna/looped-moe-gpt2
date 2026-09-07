@@ -184,36 +184,88 @@ class LoopConfig:
 
 @dataclass(frozen=True)
 class RouterConfig:
-    """Per-token adaptive loop-depth router configuration (Mixture-of-Recursions style).
+    """Per-token adaptive loop-depth router configuration.
 
-    Implements the masked-dense variant recommended in
-    ``docs/adaptive_depth_router_design.md`` step 2: every token is computed at every iteration
-    (so tensor shapes stay static, avoiding the dynamic-shape/recompilation issues found when
-    profiling :class:`~looped_moe_gpt2.model.moe.SparseMoE`), but only tokens the router keeps
-    "active" have their updated hidden state written back; exited tokens carry their
-    last-active hidden state forward unchanged for the remaining iterations.
+    Three routing mechanisms are available (``mechanism``), with important structural
+    differences documented empirically in ``docs/adaptive_depth_router_design.md``'s "Empirical
+    finding" sections:
+
+    - ``"capacity"`` (Mixture-of-Recursions style, the original implementation): every
+      iteration, exactly the top ``capacity_ratio`` FRACTION of currently-active tokens survive
+      -- this fraction is fixed by the config, not learned, so this mechanism can only learn
+      WHICH tokens occupy a predetermined-size survivor pool at each depth, never how many
+      tokens (or how much total compute) a given input receives. Found empirically to learn a
+      confidence-gating pattern (easy tokens routed deeper, not hard ones) rather than the
+      intended difficulty-gating.
+    - ``"act"`` (Adaptive Computation Time style, Graves 2016 / Universal Transformer's ACT):
+      each token independently accumulates a per-iteration halting probability and stops once
+      its own cumulative probability crosses a threshold -- no fixed survivor fraction, so
+      different inputs CAN receive different total amounts of compute. Found empirically (via
+      direct gradient inspection during this project's development) to reproduce a
+      literature-documented ACT limitation: gradient for the halting decision only flows
+      through the LAST step a token was routed through, via a "remainder" term with no
+      dependency on that step's own halting-probability output -- routers whose only role in a
+      batch is causing tokens to halt (never continuing tokens past them) receive ZERO training
+      signal. Kept in this codebase for reference/comparison, not recommended for new use.
+    - ``"pondernet"`` (Banino et al. 2021, arXiv:2107.05407): the field's own fix for ACT's
+      gradient-bias problem. Defines the probability of halting at exactly step n as
+      ``p_n = lambda_n * prod_{j<n}(1 - lambda_j)`` -- because every later p_n multiplies in
+      EVERY earlier step's lambda, gradients reach every step's halting head, not just the
+      last one. Uses a KL-divergence regularization against a geometric prior
+      (``geometric_prior_lambda``) instead of ACT's ponder-cost penalty. Recommended over
+      ``"act"`` for any real experiment.
+
+    Implements the masked-dense strategy recommended in
+    ``docs/adaptive_depth_router_design.md`` step 2 for all three mechanisms: every token is
+    computed at every iteration (so tensor shapes stay static, avoiding the dynamic-shape/
+    recompilation issues found when profiling :class:`~looped_moe_gpt2.model.moe.SparseMoE`),
+    but only tokens still active (or, for act/pondernet, not yet fully halted) have their
+    updated hidden state written back.
 
     Attributes:
-        capacity_ratio: Fraction of still-active tokens kept active at each iteration (the
-            rest exit). E.g. 0.5 means each loop iteration roughly halves the active token
-            count, so a token needs an increasingly high router score to keep going deeper.
+        mechanism: ``"capacity"``, ``"act"``, or ``"pondernet"`` -- selects which router
+            implementation :class:`~looped_moe_gpt2.model.gpt.LoopedMoEGPT` constructs.
+        capacity_ratio: Only used when ``mechanism="capacity"``. Fraction of still-active
+            tokens kept active at each iteration (the rest exit). E.g. 0.5 means each loop
+            iteration roughly halves the active token count.
         min_loops: Every token receives at least this many iterations before the router can
             exit it, preventing a degenerate all-tokens-exit-immediately collapse early in
-            training.
-        aux_loss_weight: Weight on the auxiliary loss encouraging the soft (differentiable,
-            training-time) and hard (top-k, inference-time) routing decisions to agree. See
-            the design doc's note on the hard-top-k-has-no-gradient problem.
+            training. Used by all three mechanisms.
+        aux_loss_weight: Only used when ``mechanism="capacity"``. Weight on the auxiliary loss
+            encouraging the soft (differentiable, training-time) and hard (top-k,
+            inference-time) routing decisions to agree.
+        ponder_cost_weight: Used by ``"act"`` (as the ponder cost penalty weight) and
+            ``"pondernet"`` (as ``beta``, the KL-regularization weight). Start small (e.g. 0.01)
+            and increase if tokens never halt before ``num_loops`` in practice; too large a
+            value trades away prediction quality for adaptivity.
+        geometric_prior_lambda: Only used when ``mechanism="pondernet"``. The geometric prior's
+            constant per-step halting rate -- e.g. 0.2 encodes a prior belief of an expected
+            ponder depth of ``1 / geometric_prior_lambda`` = 5 steps.
     """
 
+    mechanism: str = "capacity"
     capacity_ratio: float = 0.5
     min_loops: int = 1
     aux_loss_weight: float = 0.01
+    ponder_cost_weight: float = 0.01
+    geometric_prior_lambda: float = 0.2
 
     def __post_init__(self) -> None:
+        if self.mechanism not in ("capacity", "act", "pondernet"):
+            raise ValueError(f"mechanism must be 'capacity', 'act', or 'pondernet', got '{self.mechanism}'.")
         if not 0.0 < self.capacity_ratio <= 1.0:
             raise ValueError("capacity_ratio must be in (0, 1].")
         if self.min_loops < 1:
             raise ValueError("min_loops must be >= 1.")
+        if self.mechanism in ("act", "pondernet") and self.ponder_cost_weight <= 0.0:
+            raise ValueError(
+                f"ponder_cost_weight must be positive when mechanism='{self.mechanism}' -- "
+                f"without this regularization, the model has no incentive to ever halt early "
+                f"(more compute never hurts prediction quality, only efficiency), so this would "
+                f"silently degenerate to every token always running the full num_loops."
+            )
+        if self.mechanism == "pondernet" and not 0.0 < self.geometric_prior_lambda < 1.0:
+            raise ValueError("geometric_prior_lambda must be in (0, 1) when mechanism='pondernet'.")
         if self.aux_loss_weight < 0.0:
             raise ValueError("aux_loss_weight must be non-negative.")
 
