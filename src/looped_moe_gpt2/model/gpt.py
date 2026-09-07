@@ -323,16 +323,32 @@ class LoopedMoEGPT(nn.Module):
         }
 
     @torch.no_grad()
-    def generate(self, input_ids: torch.Tensor, max_new_tokens: int, temperature: float = 1.0) -> torch.Tensor:
-        """Autoregressively sample new tokens.
+    def generate(
+        self,
+        input_ids: torch.Tensor,
+        max_new_tokens: int,
+        temperature: float = 1.0,
+        eos_token_id: Optional[int] = None,
+    ) -> torch.Tensor:
+        """Autoregressively sample new tokens, optionally stopping early at an end-of-text token.
 
         Args:
             input_ids: Prompt token ids of shape ``(batch, seq_len)``.
-            max_new_tokens: Number of tokens to generate.
+            max_new_tokens: Maximum number of tokens to generate (generation may stop earlier,
+                per-sequence, if ``eos_token_id`` is given and gets sampled).
             temperature: Sampling temperature; must be positive.
+            eos_token_id: If given, once a sequence samples this token it stops being extended
+                (subsequent positions for that sequence are padded with ``eos_token_id`` rather
+                than continuing to sample) -- generation for the whole batch still runs until
+                EVERY sequence has stopped or ``max_new_tokens`` is reached, whichever is first.
+                If None (the default), every sequence always runs the full ``max_new_tokens``,
+                matching this method's original behavior.
 
         Returns:
-            Token ids of shape ``(batch, seq_len + max_new_tokens)``.
+            Token ids of shape ``(batch, seq_len + n)`` where ``n <= max_new_tokens`` is however
+            many steps actually ran before every sequence had stopped (or ``max_new_tokens`` if
+            ``eos_token_id`` is None or never sampled). Positions after a given sequence's own
+            stopping point are filled with ``eos_token_id``.
 
         Raises:
             ValueError: If ``temperature`` is not positive.
@@ -341,11 +357,25 @@ class LoopedMoEGPT(nn.Module):
             raise ValueError(f"temperature must be positive, got {temperature}.")
 
         self.eval()
+        batch_size = input_ids.shape[0]
+        finished = torch.zeros(batch_size, dtype=torch.bool, device=input_ids.device)
+
         for _ in range(max_new_tokens):
             context = input_ids[:, -self.config.max_seq_len :]
             logits, _ = self.forward(context)
             next_token_logits = logits[:, -1, :] / temperature
             probs = torch.softmax(next_token_logits, dim=-1)
             next_token = torch.multinomial(probs, num_samples=1)
+
+            if eos_token_id is not None:
+                next_token = torch.where(
+                    finished.unsqueeze(-1), torch.full_like(next_token, eos_token_id), next_token
+                )
+                finished = finished | (next_token.squeeze(-1) == eos_token_id)
+
             input_ids = torch.cat([input_ids, next_token], dim=1)
+
+            if eos_token_id is not None and finished.all():
+                break
+
         return input_ids

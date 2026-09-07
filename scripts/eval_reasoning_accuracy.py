@@ -38,6 +38,8 @@ from looped_moe_gpt2.utils.hub import resolve_checkpoint_and_config
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger(__name__)
 
+_GPT2_EOT_TOKEN_ID = 50256  # tiktoken "gpt2" encoding's end-of-text token; see data/tokenize.py.
+
 # NOTE: the number body is `\d[\d,]*` (must START with a digit), not `[\d,]+` (one-or-more of
 # "digit OR comma") -- the latter lets a bare comma with zero actual digits match on its own
 # (e.g. "a, b, c" matches "," ), which then fails `float(",")` after stripping commas. Found via
@@ -147,7 +149,12 @@ def main() -> None:
             logger.warning("Problem %d's prompt exceeds max_seq_len, skipping.", i)
             continue
 
-        generated = model.generate(input_ids, max_new_tokens=args.max_new_tokens, temperature=args.temperature)
+        generated = model.generate(
+            input_ids,
+            max_new_tokens=args.max_new_tokens,
+            temperature=args.temperature,
+            eos_token_id=_GPT2_EOT_TOKEN_ID,
+        )
         generated_text = encoder.decode(generated[0, input_ids.shape[1]:].tolist())
 
         predicted = extract_model_answer(generated_text)

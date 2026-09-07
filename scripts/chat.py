@@ -53,6 +53,8 @@ from looped_moe_gpt2.utils.hub import resolve_checkpoint_and_config
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger(__name__)
 
+_GPT2_EOT_TOKEN_ID = 50256  # tiktoken "gpt2" encoding's end-of-text token; see data/tokenize.py.
+
 _TEMPLATES = {
     "math": "Problem: {input}\nSolution:",
 }
@@ -177,7 +179,10 @@ def main() -> None:
         full_prompt = build_prompt(prompt, args.template, args.system_prompt)
         input_ids = torch.tensor([encoder.encode_ordinary(full_prompt)], device=device)
         generated = model.generate(
-            input_ids, max_new_tokens=args.max_new_tokens, temperature=args.temperature
+            input_ids,
+            max_new_tokens=args.max_new_tokens,
+            temperature=args.temperature,
+            eos_token_id=_GPT2_EOT_TOKEN_ID,
         )
         output_text = encoder.decode(generated[0].tolist())
         print(f"\n{output_text}\n")

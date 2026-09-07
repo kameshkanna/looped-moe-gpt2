@@ -158,6 +158,69 @@ def test_generate_produces_correct_length() -> None:
     assert generated.shape == (1, 9)
 
 
+def test_generate_without_eos_token_id_runs_full_length() -> None:
+    """Backward-compatibility guard: omitting eos_token_id (the default, None) must behave
+    exactly as before this parameter was added -- always generate the full max_new_tokens."""
+    config = _tiny_config()
+    model = LoopedMoEGPT(config)
+    prompt = torch.randint(0, TINY_VOCAB, (2, 4))
+    generated = model.generate(prompt, max_new_tokens=6, temperature=1.0, eos_token_id=None)
+    assert generated.shape == (2, 10)
+
+
+def test_generate_stops_early_when_eos_is_forced() -> None:
+    """If the model always samples the eos token (forced here via a near-zero-entropy logit
+    distribution on a single-vocab-item model), generation must stop as soon as it's sampled,
+    producing a SHORTER sequence than max_new_tokens rather than continuing to pad/sample."""
+    config = _tiny_config(vocab_size=2)  # tiny vocab: token 0 or token 1 only
+    model = LoopedMoEGPT(config)
+    eos_id = 1
+
+    # Force the LM head to always emit an overwhelming logit for `eos_id`, regardless of its
+    # input -- a monkeypatched forward rather than trying to hand-craft weight values, since
+    # final_norm's LayerNorm before lm_head makes the actual logit magnitude from a given weight
+    # value depend on activation statistics that are awkward to control directly in a test.
+    def forced_eos_logits(x: torch.Tensor) -> torch.Tensor:
+        batch, seq_len, _ = x.shape
+        logits = torch.full((batch, seq_len, 2), -100.0)
+        logits[..., eos_id] = 100.0
+        return logits
+
+    model.lm_head.forward = forced_eos_logits
+
+    prompt = torch.randint(0, 2, (1, 4))
+    generated = model.generate(prompt, max_new_tokens=20, temperature=1.0, eos_token_id=eos_id)
+    # Should stop at 1 new token (the forced EOS), not run all 20.
+    assert generated.shape[1] < 4 + 20
+    assert generated[0, 4].item() == eos_id
+
+
+def test_generate_batched_stops_per_sequence_independently() -> None:
+    """When eos_token_id is set and different sequences in a batch would naturally stop at
+    different points, the whole batch must run until every sequence has stopped (not just the
+    first), and stopped sequences must be padded with eos_token_id rather than keep sampling."""
+    config = _tiny_config()
+    model = LoopedMoEGPT(config)
+    prompt = torch.randint(0, TINY_VOCAB, (3, 4))
+    eos_id = 0
+
+    generated = model.generate(prompt, max_new_tokens=10, temperature=1.0, eos_token_id=eos_id)
+    # Every sequence must be padded to the SAME final length (the longest-running sequence's
+    # stopping point, or max_new_tokens if none stopped naturally).
+    assert generated.shape[0] == 3
+    assert generated.shape[1] <= 4 + 10
+
+    # For any sequence, once eos_id appears, every subsequent position must also be eos_id
+    # (no sampling resumes after a sequence has "finished").
+    for row in range(3):
+        seq = generated[row, 4:].tolist()
+        if eos_id in seq:
+            first_eos = seq.index(eos_id)
+            assert all(tok == eos_id for tok in seq[first_eos:]), (
+                f"Row {row} resumed sampling after EOS: {seq}"
+            )
+
+
 def test_sequence_length_exceeding_max_raises() -> None:
     config = _tiny_config()
     model = LoopedMoEGPT(config)
