@@ -1,0 +1,59 @@
+# Variant 3: looped_moe_full
+#
+# LoopMoE-style (arXiv:2606.04438): the entire block (MLA + MoE) is shared across K=2 loops,
+# with IterAdaLN conditioning and active-ratio balancing enabled. This is the primary
+# "combine Kimi-style MoE+MLA with looping" experiment. See docs/literature_survey.md §2-4.
+model:
+  vocab_size: 50257
+  hidden_size: 768
+  num_layers: 6
+  num_heads: 12
+  max_seq_len: 512
+  dropout: 0.1
+  position_encoding: decoupled_rope
+  tie_word_embeddings: true
+  seed: 1337
+  attention:
+    use_mla: true
+    kv_compression_dim: 64
+    q_compression_dim: 160
+    rope_head_dim: 32
+  moe:
+    enabled: true
+    num_routed_experts: 8
+    num_shared_experts: 1
+    top_k: 2
+    expert_intermediate_size: 512
+    bias_update_speed: 1.0e-3
+    bias_update_speed_decay_frac: 0.1
+  loop:
+    enabled: true
+    sharing_pattern: middle_cycle
+    num_loops: 2
+    num_unique_prefix_layers: 1
+    num_unique_suffix_layers: 1
+    use_iter_adaln: true
+    use_active_ratio_balancing: true
+    use_router_gating: false
+
+train:
+  train_bin_path: data/train.bin
+  val_bin_path: data/val.bin
+  output_dir: runs/03_looped_moe_full
+  batch_size: 8
+  gradient_accumulation_steps: 4
+  max_steps: 5000
+  learning_rate: 3.0e-4
+  min_learning_rate: 3.0e-5
+  warmup_steps: 200
+  weight_decay: 0.1
+  beta1: 0.9
+  beta2: 0.95
+  grad_clip_norm: 1.0
+  eval_interval: 250
+  eval_iters: 50
+  log_interval: 20
+  checkpoint_interval: 500
+  use_amp: true
+  seed: 1337
+  compile_model: false

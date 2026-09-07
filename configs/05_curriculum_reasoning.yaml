@@ -1,0 +1,98 @@
+# Variant 5: curriculum_reasoning
+#
+# ~97.5M param router-gated (per-token adaptive loop depth) looped-MoE model, trained on a
+# two-phase curriculum: general English (FineWeb-Edu) for the first 25% of training, with
+# math-reasoning data (OpenMathInstruct-2) ramping in linearly from 25%-45% of training and
+# then holding at equal weight with general for the rest of the run. General never fades out,
+# avoiding the capability-collapse risk of a pure-math cold start (see conversation discussion).
+#
+# Architecture: SharingPattern.FULL_LOOP (required for router-gating) with num_loops=3 -- the
+# per-token router (docs/adaptive_depth_router_design.md) decides how many of those 3 passes
+# each token actually needs, rather than every token getting a fixed depth. This is the
+# genuinely novel combination flagged in docs/literature_survey.md (MoE + adaptive depth
+# together) that no prior published work has tested, now exercised at real (if modest) scale.
+#
+# Token budget: deliberately below Chinchilla-optimal for 97.5M (needs ~1.95B tokens at 20x;
+# this run uses the 1.695B tokens already downloaded, ~13.6 tokens/param, ~68% of optimal) --
+# a deliberate choice to reuse existing data rather than download more, not an oversight.
+#
+# Measured on this project's RTX 4060: ~309ms/microbatch at batch_size=8, ~5.8GB peak VRAM,
+# ~13.2k tokens/sec, ~35.6 hours (~1.5 days) total for 103,454 steps.
+model:
+  vocab_size: 50257
+  hidden_size: 1024
+  num_layers: 3
+  num_heads: 16
+  max_seq_len: 512
+  dropout: 0.1
+  position_encoding: decoupled_rope
+  tie_word_embeddings: true
+  seed: 1337
+  attention:
+    use_mla: true
+    kv_compression_dim: 72
+    q_compression_dim: 216
+    rope_head_dim: 32
+  moe:
+    enabled: true
+    num_routed_experts: 8
+    num_shared_experts: 1
+    top_k: 2
+    expert_intermediate_size: 768
+    bias_update_speed: 1.0e-3
+    bias_update_speed_decay_frac: 0.1
+  loop:
+    enabled: true
+    sharing_pattern: full_loop
+    num_loops: 3
+    num_unique_prefix_layers: 1
+    num_unique_suffix_layers: 1
+    use_iter_adaln: true
+    use_active_ratio_balancing: true
+    use_router_gating: true
+    router:
+      capacity_ratio: 0.6
+      min_loops: 1
+      aux_loss_weight: 0.01
+
+train:
+  train_bin_path: data/general_train.bin  # unused (curriculum overrides), kept as a valid placeholder
+  val_bin_path: data/general_val.bin      # unused (curriculum overrides), kept as a valid placeholder
+  output_dir: runs/05_curriculum_reasoning
+  curriculum:
+    - name: general
+      train_bin_path: data/general_train.bin
+      val_bin_path: data/general_val.bin
+      start_step: 0
+      target_weight: 1.0
+      # No end_step: general never fades out, so the model keeps seeing general text for the
+      # entire run even after math ramps in (avoids the pure-math capability-collapse risk).
+    - name: math
+      train_bin_path: data/math_train.bin
+      val_bin_path: data/math_val.bin
+      start_step: 25863   # 25% of max_steps
+      ramp_steps: 20690   # 20% of max_steps -- math reaches full weight at step 46553 (45%)
+      target_weight: 1.0  # equal weight with general once fully ramped in (50/50 blend)
+  batch_size: 8
+  gradient_accumulation_steps: 4
+  max_steps: 103454
+  learning_rate: 3.0e-4
+  min_learning_rate: 3.0e-5
+  warmup_steps: 1034
+  weight_decay: 0.1
+  beta1: 0.9
+  beta2: 0.95
+  grad_clip_norm: 1.0
+  eval_interval: 2586
+  eval_iters: 50
+  log_interval: 50
+  checkpoint_interval: 2586
+  use_amp: true
+  seed: 1337
+  # Verified working (correct training dynamics, genuine per-token router variation preserved,
+  # checkpoints save/load correctly) at this exact architecture. Combined with fused AdamW
+  # (Trainer._build_optimizer applies this automatically on CUDA), measured throughput went
+  # from ~314.7ms -> ~186.0ms/microbatch -- roughly 40% faster overall, taking the estimated
+  # total run time from ~35.6 hours down to ~21.4 hours. One-time ~149s compile cost on the
+  # first step is negligible against the full run length.
+  compile_model: true

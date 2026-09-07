@@ -1,0 +1,10 @@
+# Normalize line endings to LF in the repository regardless of the checkout platform's default --
+# this project is developed on Windows but trained on Linux (e.g. RunPod H100 pods), and mixed
+# line endings between the two have caused real problems in other projects (shebang lines,
+# shell script execution, subtle diff noise).
+* text=auto eol=lf
+
+# Data/checkpoint files are git-ignored entirely (see .gitignore) but if one is ever force-added,
+# never let git attempt text normalization on it.
+*.bin binary
+*.pt binary

@@ -1,0 +1,44 @@
+# Variant 1: dense_rope
+#
+# Standard GPT-2-small (no looping, no MoE) but with full RoPE instead of learned absolute
+# position embeddings. Isolates the RoPE swap alone as a sanity-check baseline before adding
+# looping or MoE. See docs/literature_survey.md §4.
+model:
+  vocab_size: 50257
+  hidden_size: 768
+  num_layers: 12
+  num_heads: 12
+  max_seq_len: 512
+  dropout: 0.1
+  position_encoding: rope
+  tie_word_embeddings: true
+  seed: 1337
+  attention:
+    use_mla: false
+  moe:
+    enabled: false
+  loop:
+    enabled: false
+    sharing_pattern: none
+
+train:
+  train_bin_path: data/train.bin
+  val_bin_path: data/val.bin
+  output_dir: runs/01_dense_rope
+  batch_size: 8
+  gradient_accumulation_steps: 4
+  max_steps: 5000
+  learning_rate: 3.0e-4
+  min_learning_rate: 3.0e-5
+  warmup_steps: 200
+  weight_decay: 0.1
+  beta1: 0.9
+  beta2: 0.95
+  grad_clip_norm: 1.0
+  eval_interval: 250
+  eval_iters: 50
+  log_interval: 20
+  checkpoint_interval: 500
+  use_amp: true
+  seed: 1337
+  compile_model: false

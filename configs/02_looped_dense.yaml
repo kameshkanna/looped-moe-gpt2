@@ -1,0 +1,51 @@
+# Variant 2: looped_dense
+#
+# Dense FFN/attention (no MoE, no MLA), block shared with Middle-Cycle pattern (MoR-style),
+# fixed K=2 loops, IterAdaLN conditioning. Replicates Huginn/Nanbeige-style looping in isolation,
+# before combining with MoE. num_layers=6 unique, effective_depth = 1 + 4*2 + 1 = 10.
+# See docs/literature_survey.md §4.
+model:
+  vocab_size: 50257
+  hidden_size: 768
+  num_layers: 6
+  num_heads: 12
+  max_seq_len: 512
+  dropout: 0.1
+  position_encoding: rope
+  tie_word_embeddings: true
+  seed: 1337
+  attention:
+    use_mla: false
+  moe:
+    enabled: false
+  loop:
+    enabled: true
+    sharing_pattern: middle_cycle
+    num_loops: 2
+    num_unique_prefix_layers: 1
+    num_unique_suffix_layers: 1
+    use_iter_adaln: true
+    use_active_ratio_balancing: false
+    use_router_gating: false
+
+train:
+  train_bin_path: data/train.bin
+  val_bin_path: data/val.bin
+  output_dir: runs/02_looped_dense
+  batch_size: 8
+  gradient_accumulation_steps: 4
+  max_steps: 5000
+  learning_rate: 3.0e-4
+  min_learning_rate: 3.0e-5
+  warmup_steps: 200
+  weight_decay: 0.1
+  beta1: 0.9
+  beta2: 0.95
+  grad_clip_norm: 1.0
+  eval_interval: 250
+  eval_iters: 50
+  log_interval: 20
+  checkpoint_interval: 500
+  use_amp: true
+  seed: 1337
+  compile_model: false
