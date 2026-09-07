@@ -28,6 +28,7 @@ from looped_moe_gpt2.train.checkpoint import load_checkpoint
 from looped_moe_gpt2.train.diagnostics import attach_loop_diagnostics, compute_active_ratio
 from looped_moe_gpt2.utils.config_io import load_model_config
 from looped_moe_gpt2.utils.device import resolve_amp_dtype, resolve_device
+from looped_moe_gpt2.utils.hub import resolve_checkpoint_and_config
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger(__name__)
@@ -75,19 +76,36 @@ def compute_perplexity(
 def main() -> None:
     """Parse CLI arguments, load the checkpoint, and report perplexity + architecture diagnostics."""
     parser = argparse.ArgumentParser(description="Evaluate a trained checkpoint's perplexity.")
-    parser.add_argument("--checkpoint", type=Path, required=True, help="Path to a .pt checkpoint.")
-    parser.add_argument("--config", type=Path, required=True, help="Path to the variant's YAML config.")
+    parser.add_argument(
+        "--hub-repo",
+        type=str,
+        default=None,
+        help="Load checkpoint.pt + config.yaml from this Hugging Face Hub repo id "
+        "(e.g. 'Kameshr/looped-moe-gpt2-reasoning') instead of local --checkpoint/--config paths. "
+        "--val-bin must still be a local file regardless (tokenized data isn't hosted on the Hub repo).",
+    )
+    parser.add_argument("--checkpoint", type=Path, default=None, help="Path to a local .pt checkpoint.")
+    parser.add_argument("--config", type=Path, default=None, help="Path to the variant's local YAML config.")
     parser.add_argument("--val-bin", type=Path, required=True, help="Path to the tokenized validation .bin file.")
     parser.add_argument("--batch-size", type=int, default=8, help="Evaluation batch size.")
     parser.add_argument("--max-batches", type=int, default=None, help="Cap on number of batches (default: full val set).")
     args = parser.parse_args()
 
+    if args.hub_repo is not None:
+        if args.checkpoint is not None or args.config is not None:
+            raise ValueError("Pass either --hub-repo, or --checkpoint/--config, not both.")
+        checkpoint_path, config_path = resolve_checkpoint_and_config(args.hub_repo)
+    elif args.checkpoint is not None and args.config is not None:
+        checkpoint_path, config_path = args.checkpoint, args.config
+    else:
+        raise ValueError("Must pass either --hub-repo, or both --checkpoint and --config.")
+
     device = resolve_device()
     amp_dtype = resolve_amp_dtype(device)
-    model_config = load_model_config(args.config)
+    model_config = load_model_config(config_path)
     model = LoopedMoEGPT(model_config).to(device)
 
-    checkpoint = load_checkpoint(args.checkpoint, device)
+    checkpoint = load_checkpoint(checkpoint_path, device)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
     logger.info("Loaded checkpoint from step %d", checkpoint["step"])
@@ -98,8 +116,8 @@ def main() -> None:
 
     mean_loss, perplexity = compute_perplexity(model, loader, device, amp_dtype, args.max_batches)
     print(f"\n{'=' * 50}")
-    print(f"Checkpoint:       {args.checkpoint}")
-    print(f"Config:           {args.config}")
+    print(f"Checkpoint:       {checkpoint_path}")
+    print(f"Config:           {config_path}")
     print(f"Mean cross-entropy loss: {mean_loss:.4f}")
     print(f"Perplexity:              {perplexity:.2f}")
     print(f"{'=' * 50}\n")
