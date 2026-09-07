@@ -1,0 +1,76 @@
+# Variant 6: deep_loop_diagnostic
+#
+# Local RTX 4060 diagnostic run: does the per-token adaptive-depth router show a real
+# difficulty-depth correlation when given real dynamic range (num_loops=12, vs. the earlier
+# variant 05's num_loops=3, which only allowed 2 non-degenerate exit points after min_loops=1
+# and showed no clear difficulty correlation across a small manual sample). General-pretraining
+# corpus only (FineWeb-Edu) -- no math curriculum here, this run is purely about characterizing
+# the router mechanism itself, not about reasoning capability.
+#
+# ~75.7M params (close to the earlier validated 85M-scale ablation regime), effective_depth=14
+# (1 prefix + 12 loop + 1 suffix). Measured on this project's RTX 4060: ~315.7ms/microbatch at
+# batch_size=4, ~4.76GB peak VRAM. At batch_size=4, grad_accum=8 (effective batch 32, matching
+# the original 85M ablation's effective batch), 2850 steps consumes ~46.7M tokens in ~2 hours.
+#
+# NOTE: 46.7M tokens is far below Chinchilla-optimal for 75.7M params (~1.5B at 20x) -- this is
+# intentional. This run's purpose is diagnosing the router mechanism (does exit-depth correlate
+# with anything meaningful once given real range), not producing a well-trained model. Do not
+# draw conclusions about overall model quality from this run's perplexity alone.
+model:
+  vocab_size: 50257
+  hidden_size: 896
+  num_layers: 3
+  num_heads: 14
+  max_seq_len: 512
+  dropout: 0.1
+  position_encoding: decoupled_rope
+  tie_word_embeddings: true
+  seed: 1337
+  attention:
+    use_mla: true
+    kv_compression_dim: 64
+    q_compression_dim: 192
+    rope_head_dim: 32
+  moe:
+    enabled: true
+    num_routed_experts: 8
+    num_shared_experts: 1
+    top_k: 2
+    expert_intermediate_size: 576
+    bias_update_speed: 1.0e-3
+    bias_update_speed_decay_frac: 0.1
+  loop:
+    enabled: true
+    sharing_pattern: full_loop
+    num_loops: 12
+    num_unique_prefix_layers: 1
+    num_unique_suffix_layers: 1
+    use_iter_adaln: true
+    use_active_ratio_balancing: true
+    use_router_gating: true
+    router:
+      capacity_ratio: 0.7
+      min_loops: 1
+      aux_loss_weight: 0.01
+
+train:
+  train_bin_path: data/general_train.bin
+  val_bin_path: data/general_val.bin
+  output_dir: runs/06_deep_loop_diagnostic
+  batch_size: 4
+  gradient_accumulation_steps: 8
+  max_steps: 2850
+  learning_rate: 3.0e-4
+  min_learning_rate: 3.0e-5
+  warmup_steps: 28
+  weight_decay: 0.1
+  beta1: 0.9
+  beta2: 0.95
+  grad_clip_norm: 1.0
+  eval_interval: 71
+  eval_iters: 30
+  log_interval: 100
+  checkpoint_interval: 71
+  use_amp: true
+  seed: 1337
+  compile_model: true
