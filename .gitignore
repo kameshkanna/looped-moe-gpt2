@@ -17,12 +17,15 @@ venv/
 
 # Data: tokenized corpora are large (GB-scale) and reproducible via scripts/prepare_*.py --
 # never commit these. See docs/literature_survey.md and README for how to regenerate.
-data/
+# NOTE: leading "/" anchors this to the repo root only -- without it, this pattern also matched
+# (and silently excluded from git) src/looped_moe_gpt2/data/, the actual Python source
+# subpackage, which broke every import of looped_moe_gpt2.train.trainer on a fresh clone.
+/data/
 *.bin
 
 # Training outputs: checkpoints are large (GB-scale per file) and are run artifacts, not
 # source -- never commit these either.
-runs/
+/runs/
 
 # OS/editor cruft
 .DS_Store
