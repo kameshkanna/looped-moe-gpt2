@@ -55,16 +55,30 @@ finished after 15+ minutes on `/mnt/c` completed the download+unpack in under 3 
    TVM rewrite — a lightweight package whose only dependencies are `torch`, `ninja`, `einops`,
    `transformers`, `packaging`, `setuptools`.
 
-2. **`causal-conv1d==1.4.0`'s PyPI sdist is missing its own CUDA source.** The tarball on PyPI
-   for that exact version contains only the Python wrapper files (`causal_conv1d_interface.py`,
-   `causal_conv1d_varlen.py`, `__init__.py`) — no `csrc/` directory at all, so `pip install
-   causal-conv1d==1.4.0 --no-build-isolation` fails immediately with `ninja: error: ... csrc/
-   causal_conv1d.cpp ... missing and no known rule to make it` (the package's own `setup.py`
-   normally downloads a precompiled wheel from GitHub Releases first and only falls back to a
-   from-source build if that 404s, which is what happened here — no matching wheel existed for
-   this torch/CUDA/Python combination). **Fix:** install directly from the git tag instead of
-   PyPI: `pip install 'causal-conv1d @ git+https://github.com/Dao-AILab/causal-conv1d.git@v1.4.0'
-   --no-build-isolation`, which does contain the full `csrc/` sources.
+2. **Both `causal-conv1d==1.4.0` AND `mamba-ssm==2.2.4`'s PyPI sdists are missing their own
+   CUDA source directories.** Confirmed on two separate machines (this project's RTX 4060 via
+   WSL, and later a RunPod A100 pod) that the exact same class of bug hits both packages, not
+   just one: the PyPI tarball for `causal-conv1d==1.4.0` contains only the Python wrapper files
+   (`causal_conv1d_interface.py`, `causal_conv1d_varlen.py`, `__init__.py`) — no `csrc/`
+   directory at all; `mamba-ssm==2.2.4`'s PyPI sdist is similarly missing
+   `csrc/selective_scan/selective_scan.cpp`. Both fail identically: `pip install ... --no-
+   build-isolation` gets past dependency resolution and metadata prep, then fails at the
+   `ninja`/`build_ext` step with `... missing and no known rule to make it` (or `cc1plus: fatal
+   error: ... No such file or directory` when a compiler invocation runs directly instead of
+   through ninja) — in both cases, the package's own `setup.py` normally tries to download a
+   precompiled wheel from GitHub Releases first and only falls back to a from-source build if
+   that URL 404s, which is what happens whenever no prebuilt wheel matches the exact torch/CUDA/
+   Python combination in use (true on both the WSL/4060 and RunPod/A100 environments tested).
+   **Fix, for both packages:** install directly from the git tag instead of PyPI:
+   ```
+   pip install --no-build-isolation 'mamba-ssm @ git+https://github.com/state-spaces/mamba.git@v2.2.4'
+   pip install --no-build-isolation 'causal-conv1d @ git+https://github.com/Dao-AILab/causal-conv1d.git@v1.4.0'
+   ```
+   Both git tags contain the full `csrc/` sources the PyPI sdists are missing. Given this now
+   confirmed pattern (two-for-two packages from the same `state-spaces`/`Dao-AILab` ecosystem),
+   treat "PyPI sdist missing csrc/" as the default expectation for any package in this family
+   at a version without a matching prebuilt wheel, not a one-off fluke -- go straight to the
+   git-tag install rather than debugging the PyPI path first.
 
 3. **`transformers` version skew breaks `mamba_ssm`'s own import chain, unrelated to the CUDA
    kernels.** `mamba_ssm==2.2.4`'s `utils/generation.py` imports `GreedySearchDecoderOnlyOutput`

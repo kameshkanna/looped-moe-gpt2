@@ -52,10 +52,15 @@ echo "--- Installing Mamba-2 dependencies (mamba_ssm, causal-conv1d) ---"
 echo "This compiles CUDA kernels from source -- expect several minutes. See"
 echo "docs/mamba_investigation.md for the version pins and why they matter:"
 echo "mamba-ssm 2.3.x pulls in a heavy TileLang/TVM/CUDA-13 stack that would"
-echo "upgrade torch itself; causal-conv1d 1.4.0's PyPI sdist is missing its"
-echo "own CUDA sources, so it must come from the git tag instead."
+echo "upgrade torch itself; BOTH mamba-ssm==2.2.4 and causal-conv1d==1.4.0's"
+echo "PyPI sdists are missing their own csrc/ CUDA sources (confirmed on two"
+echo "separate machines) -- both must come from their git tags instead, with"
+echo "--no-build-isolation so they build against the venv's own torch rather"
+echo "than resolving a fresh (and possibly CUDA-version-mismatched) one."
 pip install --quiet 'transformers==4.44.2'
-pip install --quiet 'mamba-ssm==2.2.4'
+pip install --quiet packaging ninja setuptools wheel
+pip install --quiet --no-build-isolation \
+    'mamba-ssm @ git+https://github.com/state-spaces/mamba.git@v2.2.4'
 MAX_JOBS=4 pip install --quiet \
     'causal-conv1d @ git+https://github.com/Dao-AILab/causal-conv1d.git@v1.4.0' \
     --no-build-isolation
