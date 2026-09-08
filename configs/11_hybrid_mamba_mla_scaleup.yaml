@@ -39,6 +39,17 @@
 # Also rescale warmup_steps (~1%), eval_interval (~2.5%), and checkpoint_interval (~10%, per
 # this run's explicit "checkpoint every 10% of training" choice) proportionally to the
 # recomputed max_steps.
+#
+# use_gradient_checkpointing: true is REQUIRED at this scale -- a real A100 profiling run at
+# batch_size=8, seq_len=2048 measured ~42GB peak VRAM with batch_size=16 already OOM'ing,
+# because with effective_depth=26 and no checkpointing the backward pass held every one of the
+# 26 loop iterations' activations simultaneously, and Mamba-2's own SSD chunked-scan algorithm
+# has non-trivial per-layer backward memory on top of that (documented upstream: ~33% more
+# memory than Mamba-1 at seq_len=2048 from block-wise state materialization). See
+# docs/mamba_investigation.md for the full diagnosis, including a real, separately-fixed SDPA
+# bug (explicit boolean attn_mask forcing a fallback off the memory-efficient kernel) that was
+# a smaller contributor. Re-profile batch size AFTER pulling this fix -- checkpointing trades
+# recompute for memory, so both max usable batch size and per-step wall-clock time change.
 model:
   vocab_size: 50257
   hidden_size: 768
@@ -48,6 +59,7 @@ model:
   dropout: 0.1
   position_encoding: decoupled_rope
   tie_word_embeddings: true
+  use_gradient_checkpointing: true
   seed: 1337
   attention:
     use_mla: true

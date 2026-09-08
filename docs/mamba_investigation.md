@@ -207,6 +207,56 @@ wrapping a module that itself dispatches into hand-written Triton kernels is an 
 extra moving part for a first diagnostic run) and `true` for the MLA baseline (matching how that
 architecture has always been run in this project).
 
+## 8.5. Real A100 profiling: a 3-part memory diagnosis (SDPA mask, no checkpointing, Mamba-2 itself)
+
+Profiling `configs/11` on a real RunPod A100 SXM (80GB) at `max_seq_len=2048` found peak VRAM
+of ~42-54GB at `batch_size=8` alone, with `batch_size=16` already OOM'ing -- far higher than
+the ~2.2GB of fixed weight/optimizer/gradient overhead this model size implies, meaning
+roughly 40-50GB was activation memory for just 16,384 tokens (~3MB/token, abnormally high).
+Diagnosed to three separate, additive causes:
+
+1. **A real SDPA bug, now fixed** (see the commit "Fix SDPA attention to use is_causal=True
+   instead of an explicit bool mask tensor"): both `MultiHeadLatentAttention` and
+   `StandardMultiHeadAttention` called `scaled_dot_product_attention` with an explicit boolean
+   `attn_mask` tensor (a plain causal mask, no padding) instead of `is_causal=True`. An
+   explicit mask tensor prevents SDPA from dispatching to the Flash Attention / memory-
+   efficient backend on many PyTorch versions, forcing a fallback to the "math" backend that
+   materializes a full `(B, H, T, T)` score matrix. This predates the Mamba work entirely --
+   every attention-using config in this project paid this cost silently. Fixed by switching to
+   `is_causal=True`, which is functionally identical for this codebase (the mask was always
+   plain causal, never used for padding).
+
+2. **No gradient/activation checkpointing anywhere in the loop, now added** (see
+   `ModelConfig.use_gradient_checkpointing` and `LoopedMoEGPT._run_block`): with
+   `effective_depth=26` (this project's looped architectures routinely have double-digit
+   effective depth) and no checkpointing, the backward pass had to hold EVERY loop iteration's
+   activations simultaneously -- a 26x activation-memory multiplier that dominates at this
+   scale regardless of what the per-layer cost is. Added as an opt-in `ModelConfig` field
+   (`use_gradient_checkpointing: bool = False`, defaulting to unchanged behavior for every
+   existing config) wrapping each block application in `torch.utils.checkpoint.checkpoint`
+   with `use_reentrant=False`. Verified numerically identical to the non-checkpointed path
+   (same loss, same gradients to `atol=1e-4`) via a dedicated test
+   (`test_gradient_checkpointing_matches_non_checkpointed_loss_and_grads`), not just "runs
+   without crashing."
+
+3. **Mamba-2's own SSD algorithm has genuinely higher backward memory than plain attention or
+   Mamba-1 at this sequence length** -- this is a documented, upstream characteristic, not a
+   bug in this codebase: at `seq_len=2048`, Mamba-2's chunked-scan formulation is reported to
+   use roughly 33% more memory than Mamba-1 due to block-wise state materialization, and its
+   higher backward memory in general comes from storing per-chunk intermediates needed for the
+   backward pass. `mamba_ssm.Mamba2`'s default `chunk_size=256` divides 2048 evenly (8 chunks),
+   so this is not a misconfiguration -- it is simply a real cost of the algorithm at this
+   context length, and gradient checkpointing (item 2) is the primary lever available to
+   manage it, since it applies per-loop-iteration regardless of what makes any single
+   iteration's activations expensive.
+
+**Practical upshot:** `configs/11_hybrid_mamba_mla_scaleup.yaml` now sets
+`use_gradient_checkpointing: true`. Re-run `scripts/profile_batch_size.py` on the actual pod
+after pulling both fixes -- expect a substantially larger usable batch size, at the cost of
+somewhat higher per-step wall-clock time (checkpointing recomputes each block's forward pass
+during backward). The exact new numbers were not yet measured as of this writing; do not trust
+the config's placeholder `max_steps` until re-profiled.
+
 ## 9. Running the three variants
 
 One at a time (single GPU) — see the commands in the session's own record; in short:

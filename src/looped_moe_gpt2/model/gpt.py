@@ -17,6 +17,7 @@ import logging
 from typing import Optional
 
 import torch
+import torch.utils.checkpoint
 from torch import nn
 
 from looped_moe_gpt2.model.act_router import ACTRouter
@@ -184,6 +185,29 @@ class LoopedMoEGPT(nn.Module):
             mamba_config=config.mamba,
         )
 
+    def _run_block(self, block_idx: int, x: torch.Tensor, iteration_idx: Optional[int]) -> torch.Tensor:
+        """Apply one block, optionally under gradient checkpointing.
+
+        Centralizes the ``config.use_gradient_checkpointing`` branch so every call site in this
+        class (the main loop and all three router-gated loop variants) applies it consistently,
+        rather than duplicating the branch at each of the ~10 block-invocation sites. See
+        :attr:`~looped_moe_gpt2.model.config.ModelConfig.use_gradient_checkpointing` for why
+        this matters for a looped architecture in particular.
+
+        Args:
+            block_idx: Index into ``self.blocks`` of the block to run.
+            x: Input hidden states, shape ``(batch, seq_len, hidden_size)``.
+            iteration_idx: Current loop iteration (0-indexed), or None for non-looped
+                (prefix/suffix) blocks -- passed through to :meth:`TransformerBlock.forward`.
+
+        Returns:
+            Output hidden states, same shape as ``x``.
+        """
+        block = self.blocks[block_idx]
+        if self.config.use_gradient_checkpointing and self.training:
+            return torch.utils.checkpoint.checkpoint(block, x, iteration_idx, use_reentrant=False)
+        return block(x, iteration_idx=iteration_idx)
+
     @staticmethod
     def _init_weights(module: nn.Module) -> None:
         """Apply GPT-2-style weight initialization.
@@ -236,7 +260,7 @@ class LoopedMoEGPT(nn.Module):
                 x = self._forward_router_gated_loop(x)
         else:
             for block_idx, iteration_idx in self.loop_plan:
-                x = self.blocks[block_idx](x, iteration_idx=iteration_idx)
+                x = self._run_block(block_idx, x, iteration_idx)
 
         x = self.final_norm(x)
         logits = self.lm_head(x)
@@ -283,7 +307,7 @@ class LoopedMoEGPT(nn.Module):
         ]
 
         for block_idx in prefix_indices:
-            x = self.blocks[block_idx](x, iteration_idx=None)
+            x = self._run_block(block_idx, x, None)
 
         batch_size, seq_len, _ = x.shape
         active_mask = torch.ones(batch_size, seq_len, dtype=torch.bool, device=x.device)
@@ -291,7 +315,7 @@ class LoopedMoEGPT(nn.Module):
         total_aux_loss = torch.zeros((), device=x.device, dtype=x.dtype)
 
         for iteration_idx in range(self.config.loop.num_loops):
-            block_out = self.blocks[body_block_idx](x, iteration_idx=iteration_idx)
+            block_out = self._run_block(body_block_idx, x, iteration_idx)
             force_keep_all = iteration_idx < self.router_min_loops
             next_active_mask, soft_keep_prob, aux_loss = self.routers[iteration_idx](
                 x, active_mask, force_keep_all=force_keep_all
@@ -310,7 +334,7 @@ class LoopedMoEGPT(nn.Module):
         self.last_exit_iteration = exit_iteration
 
         for block_idx in suffix_indices:
-            x = self.blocks[block_idx](x, iteration_idx=None)
+            x = self._run_block(block_idx, x, None)
 
         return x
 
@@ -348,7 +372,7 @@ class LoopedMoEGPT(nn.Module):
         ]
 
         for block_idx in prefix_indices:
-            x = self.blocks[block_idx](x, iteration_idx=None)
+            x = self._run_block(block_idx, x, None)
 
         batch_size, seq_len, _ = x.shape
         still_running = torch.ones(batch_size, seq_len, dtype=torch.bool, device=x.device)
@@ -358,7 +382,7 @@ class LoopedMoEGPT(nn.Module):
         total_ponder_steps = torch.zeros(batch_size, seq_len, device=x.device, dtype=x.dtype)
 
         for iteration_idx in range(self.config.loop.num_loops):
-            block_out = self.blocks[body_block_idx](x, iteration_idx=iteration_idx)
+            block_out = self._run_block(body_block_idx, x, iteration_idx)
             force_continue = iteration_idx < self.router_min_loops
             update_weight, cumulative_halting_prob, newly_halted, step_ponder_cost = self.routers[iteration_idx](
                 x, cumulative_halting_prob, still_running, force_continue=force_continue
@@ -388,7 +412,7 @@ class LoopedMoEGPT(nn.Module):
 
         x = accumulated_output
         for block_idx in suffix_indices:
-            x = self.blocks[block_idx](x, iteration_idx=None)
+            x = self._run_block(block_idx, x, None)
 
         return x
 
@@ -427,7 +451,7 @@ class LoopedMoEGPT(nn.Module):
         ]
 
         for block_idx in prefix_indices:
-            x = self.blocks[block_idx](x, iteration_idx=None)
+            x = self._run_block(block_idx, x, None)
 
         batch_size, seq_len, _ = x.shape
         un_halted_prob = torch.ones(batch_size, seq_len, device=x.device, dtype=x.dtype)
@@ -436,7 +460,7 @@ class LoopedMoEGPT(nn.Module):
         p_n_sequence = []
 
         for iteration_idx in range(self.config.loop.num_loops):
-            block_out = self.blocks[body_block_idx](x, iteration_idx=iteration_idx)
+            block_out = self._run_block(body_block_idx, x, iteration_idx)
             is_last_step = iteration_idx == self.config.loop.num_loops - 1
             # min_loops is enforced by forcing lambda_n=0 (never halt yet) below min_loops,
             # rather than PonderNetRouter's own is_last_step branch -- min_loops and
@@ -465,7 +489,7 @@ class LoopedMoEGPT(nn.Module):
 
         x = accumulated_output
         for block_idx in suffix_indices:
-            x = self.blocks[block_idx](x, iteration_idx=None)
+            x = self._run_block(block_idx, x, None)
 
         return x
 

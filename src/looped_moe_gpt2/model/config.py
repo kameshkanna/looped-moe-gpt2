@@ -357,6 +357,20 @@ class ModelConfig:
             ``MixerType.MAMBA2`` or ``MixerType.HYBRID_MAMBA_ATTENTION``.
         tie_word_embeddings: If True, tie the input embedding and output projection weights
             (standard GPT-2 practice; reduces params).
+        use_gradient_checkpointing: If True, wrap each loop-body block application in
+            ``torch.utils.checkpoint.checkpoint`` -- recomputes that block's forward pass
+            during the backward pass instead of storing its activations, trading extra compute
+            (roughly one additional forward pass per checkpointed block) for a large activation
+            memory reduction. Particularly important for a looped architecture: without this,
+            the backward pass must hold EVERY loop iteration's activations simultaneously (a
+            model with ``effective_depth=26`` pays a 26x activation-memory multiplier over an
+            equivalent non-looped model), which was found empirically to be the dominant cost
+            behind unexpectedly high VRAM usage for the Mamba-2 mixer at long sequence lengths
+            (Mamba-2's own SSD chunked-scan algorithm already has non-trivial per-layer
+            backward memory for its chunk intermediates; see docs/mamba_investigation.md).
+            Only unique (prefix/suffix) blocks and the shared loop-body block(s) actually
+            iterated via ``loop_plan`` are checkpointed -- see
+            :meth:`~looped_moe_gpt2.model.gpt.LoopedMoEGPT.forward`.
         seed: Random seed for reproducible initialization.
     """
 
@@ -373,6 +387,7 @@ class ModelConfig:
     mixer_type: MixerType = MixerType.ATTENTION
     mamba: Optional[MambaConfig] = None
     tie_word_embeddings: bool = True
+    use_gradient_checkpointing: bool = False
     seed: int = 1337
 
     def __post_init__(self) -> None:

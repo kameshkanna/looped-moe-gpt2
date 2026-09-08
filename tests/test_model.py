@@ -230,3 +230,45 @@ def test_sequence_length_exceeding_max_raises() -> None:
         assert False, "Expected ValueError for oversized sequence length."
     except ValueError:
         pass
+
+
+def test_gradient_checkpointing_matches_non_checkpointed_loss_and_grads() -> None:
+    """Checkpointing trades compute for memory -- it must not change the result.
+
+    Loads the checkpointed model's weights from the non-checkpointed one (rather than relying
+    on both using the same seed) so this test cannot pass by accident if some other source of
+    nondeterminism happened to coincide.
+    """
+    base_kwargs = dict(
+        vocab_size=TINY_VOCAB,
+        hidden_size=TINY_HIDDEN,
+        num_layers=TINY_LAYERS,
+        num_heads=TINY_HEADS,
+        max_seq_len=TINY_SEQ_LEN,
+        dropout=0.0,
+        position_encoding=PositionEncodingType.DECOUPLED_ROPE,
+        attention=AttentionConfig(use_mla=True, kv_compression_dim=8, q_compression_dim=12, rope_head_dim=4),
+        moe=MoEConfig(enabled=True, num_routed_experts=4, num_shared_experts=1, top_k=2, expert_intermediate_size=16),
+        loop=LoopConfig(enabled=True, sharing_pattern=SharingPattern.MIDDLE_CYCLE, num_loops=2, num_unique_prefix_layers=1, num_unique_suffix_layers=1),
+    )
+    torch.manual_seed(0)
+    input_ids = torch.randint(0, TINY_VOCAB, (2, TINY_SEQ_LEN))
+    targets = torch.randint(0, TINY_VOCAB, (2, TINY_SEQ_LEN))
+
+    model_no_ckpt = LoopedMoEGPT(ModelConfig(**base_kwargs, use_gradient_checkpointing=False))
+    model_no_ckpt.train()
+    _, loss_no_ckpt = model_no_ckpt(input_ids, targets=targets)
+    loss_no_ckpt.backward()
+    grads_no_ckpt = {n: p.grad.clone() for n, p in model_no_ckpt.named_parameters() if p.grad is not None}
+
+    model_ckpt = LoopedMoEGPT(ModelConfig(**base_kwargs, use_gradient_checkpointing=True))
+    model_ckpt.load_state_dict(model_no_ckpt.state_dict())
+    model_ckpt.train()
+    _, loss_ckpt = model_ckpt(input_ids, targets=targets)
+    loss_ckpt.backward()
+
+    assert torch.allclose(loss_no_ckpt, loss_ckpt, atol=1e-5)
+    for name, grad in grads_no_ckpt.items():
+        ckpt_param = dict(model_ckpt.named_parameters())[name]
+        assert ckpt_param.grad is not None, f"{name} has no gradient under checkpointing."
+        assert torch.allclose(grad, ckpt_param.grad, atol=1e-4), f"Gradient mismatch for {name}."
