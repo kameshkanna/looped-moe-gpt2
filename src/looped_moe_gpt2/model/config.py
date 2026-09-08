@@ -49,11 +49,40 @@ class PositionEncodingType(str, Enum):
         DECOUPLED_ROPE: DeepSeek-V3 / Kimi K2 style MLA decoupled RoPE, applied only to a small
             per-head slice; the remaining ("NoPE") slice is position-agnostic and derived from
             the compressed latent. Required when ``AttentionConfig.use_mla`` is True.
+        NONE: No explicit positional encoding is added by the block-level attention path.
+            Used with ``MixerType.MAMBA2``, whose sequential recurrence is itself
+            position-sensitive (no permutation-equivariant attention step requires RoPE).
     """
 
     LEARNED = "learned"
     ROPE = "rope"
     DECOUPLED_ROPE = "decoupled_rope"
+    NONE = "none"
+
+
+class MixerType(str, Enum):
+    """Which sequence-mixing mechanism a transformer block uses in place of (or alongside)
+    attention.
+
+    Attributes:
+        ATTENTION: Standard or MLA self-attention only (the original architecture of this
+            codebase), selected via ``AttentionConfig.use_mla``.
+        MAMBA2: Mamba-2 state-space sequence mixer only (arXiv:2405.21060), replacing
+            attention entirely. Uses ``mamba_ssm.Mamba2``'s fused SSD (structured state-space
+            duality) CUDA/Triton kernels. See :class:`MambaConfig` and
+            ``docs/mamba_investigation.md``.
+        HYBRID_MAMBA_ATTENTION: Both a Mamba-2 mixer and MLA/MHA attention are applied in
+            sequence within the same shared block (Mamba-2 first, then attention), each with
+            its own pre-norm and residual connection, following the Jamba/Zamba-style
+            hybridization pattern of interleaving SSM and attention layers -- here fused into
+            a single block position rather than alternated across separate block positions, so
+            that looping over one shared block still lets a token pass through both mechanisms
+            every iteration.
+    """
+
+    ATTENTION = "attention"
+    MAMBA2 = "mamba2"
+    HYBRID_MAMBA_ATTENTION = "hybrid_mamba_attention"
 
 
 @dataclass(frozen=True)
@@ -127,6 +156,41 @@ class AttentionConfig:
             raise ValueError("Compression dimensions must be positive.")
         if self.rope_head_dim < 1:
             raise ValueError("rope_head_dim must be positive.")
+
+
+@dataclass(frozen=True)
+class MambaConfig:
+    """Mamba-2 state-space sequence mixer configuration (arXiv:2405.21060).
+
+    Only meaningful when ``ModelConfig.mixer_type`` is ``MixerType.MAMBA2`` or
+    ``MixerType.HYBRID_MAMBA_ATTENTION``. Dimension names follow ``mamba_ssm.Mamba2``'s own
+    constructor argument names directly, so this dataclass is a thin, validated, typed
+    passthrough rather than a reinterpretation.
+
+    Attributes:
+        d_state: SSM state expansion factor per channel (Mamba-2's ``d_state``). The original
+            Mamba-2 paper uses 128 at large scale; 64 is a reasonable reduction for GPT-2 scale.
+        d_conv: Width of the local causal depthwise convolution applied before the SSM scan.
+        expand: Expansion factor for the mixer's internal (inner) channel width relative to
+            ``hidden_size``, i.e. inner_dim = ``expand * hidden_size``.
+        headdim: Per-head dimension inside the SSM. ``inner_dim`` must be evenly divisible by
+            ``headdim``, and ``mamba_ssm``'s fused Triton kernels additionally require the
+            resulting tensor strides be multiples of 8 -- concretely, keep
+            ``(expand * hidden_size) // headdim`` a multiple of 8 (e.g. hidden_size=256,
+            expand=2, headdim=64 gives 8 heads exactly).
+        ngroups: Number of groups sharing a single set of B/C SSM parameters (Mamba-2's
+            multi-value-attention-style grouping); 1 recovers the original single-group design.
+    """
+
+    d_state: int = 64
+    d_conv: int = 4
+    expand: int = 2
+    headdim: int = 64
+    ngroups: int = 1
+
+    def __post_init__(self) -> None:
+        if self.d_state < 1 or self.d_conv < 1 or self.expand < 1 or self.headdim < 1 or self.ngroups < 1:
+            raise ValueError("All MambaConfig dimensions must be positive integers.")
 
 
 @dataclass(frozen=True)
@@ -287,6 +351,10 @@ class ModelConfig:
         attention: See :class:`AttentionConfig`.
         moe: See :class:`MoEConfig`.
         loop: See :class:`LoopConfig`.
+        mixer_type: See :class:`MixerType`. Determines whether each block uses attention only,
+            a Mamba-2 mixer only, or both in a hybrid block.
+        mamba: See :class:`MambaConfig`. Required (and only meaningful) when ``mixer_type`` is
+            ``MixerType.MAMBA2`` or ``MixerType.HYBRID_MAMBA_ATTENTION``.
         tie_word_embeddings: If True, tie the input embedding and output projection weights
             (standard GPT-2 practice; reduces params).
         seed: Random seed for reproducible initialization.
@@ -302,6 +370,8 @@ class ModelConfig:
     attention: AttentionConfig = field(default_factory=AttentionConfig)
     moe: MoEConfig = field(default_factory=MoEConfig)
     loop: LoopConfig = field(default_factory=LoopConfig)
+    mixer_type: MixerType = MixerType.ATTENTION
+    mamba: Optional[MambaConfig] = None
     tie_word_embeddings: bool = True
     seed: int = 1337
 
@@ -311,21 +381,49 @@ class ModelConfig:
                 f"hidden_size ({self.hidden_size}) must be divisible by num_heads "
                 f"({self.num_heads})."
             )
-        if self.attention.use_mla and self.position_encoding != PositionEncodingType.DECOUPLED_ROPE:
+        uses_mamba = self.mixer_type in (MixerType.MAMBA2, MixerType.HYBRID_MAMBA_ATTENTION)
+        uses_attention = self.mixer_type in (MixerType.ATTENTION, MixerType.HYBRID_MAMBA_ATTENTION)
+        if uses_mamba and self.mamba is None:
             raise ValueError(
-                "AttentionConfig.use_mla=True requires "
-                "position_encoding=PositionEncodingType.DECOUPLED_ROPE."
+                f"mamba config must be provided when mixer_type={self.mixer_type.value!r}."
             )
-        if not self.attention.use_mla and self.position_encoding == PositionEncodingType.DECOUPLED_ROPE:
+        if uses_mamba:
+            inner_dim = self.mamba.expand * self.hidden_size
+            if inner_dim % self.mamba.headdim != 0:
+                raise ValueError(
+                    f"mamba.expand * hidden_size ({inner_dim}) must be divisible by "
+                    f"mamba.headdim ({self.mamba.headdim})."
+                )
+            num_mamba_heads = inner_dim // self.mamba.headdim
+            if num_mamba_heads % 8 != 0:
+                raise ValueError(
+                    f"(mamba.expand * hidden_size) // mamba.headdim ({num_mamba_heads}) must be "
+                    f"a multiple of 8 -- mamba_ssm's fused Triton kernels require tensor strides "
+                    f"that are multiples of 8. Adjust hidden_size, mamba.expand, or "
+                    f"mamba.headdim."
+                )
+        if self.mixer_type == MixerType.MAMBA2 and self.position_encoding != PositionEncodingType.NONE:
             raise ValueError(
-                "position_encoding=DECOUPLED_ROPE requires AttentionConfig.use_mla=True."
+                "mixer_type=MixerType.MAMBA2 (no attention path) requires "
+                "position_encoding=PositionEncodingType.NONE -- Mamba-2's recurrence is itself "
+                "position-sensitive and does not consume RoPE/learned position embeddings."
             )
-        head_dim = self.hidden_size // self.num_heads
-        if self.attention.use_mla and self.attention.rope_head_dim > head_dim:
-            raise ValueError(
-                f"rope_head_dim ({self.attention.rope_head_dim}) cannot exceed the per-head "
-                f"dimension ({head_dim})."
-            )
+        if uses_attention:
+            if self.attention.use_mla and self.position_encoding != PositionEncodingType.DECOUPLED_ROPE:
+                raise ValueError(
+                    "AttentionConfig.use_mla=True requires "
+                    "position_encoding=PositionEncodingType.DECOUPLED_ROPE."
+                )
+            if not self.attention.use_mla and self.position_encoding == PositionEncodingType.DECOUPLED_ROPE:
+                raise ValueError(
+                    "position_encoding=DECOUPLED_ROPE requires AttentionConfig.use_mla=True."
+                )
+            head_dim = self.hidden_size // self.num_heads
+            if self.attention.use_mla and self.attention.rope_head_dim > head_dim:
+                raise ValueError(
+                    f"rope_head_dim ({self.attention.rope_head_dim}) cannot exceed the per-head "
+                    f"dimension ({head_dim})."
+                )
         if self.loop.enabled:
             min_layers = self.loop.num_unique_prefix_layers + self.loop.num_unique_suffix_layers
             if self.loop.sharing_pattern != SharingPattern.NONE and self.num_layers <= min_layers:

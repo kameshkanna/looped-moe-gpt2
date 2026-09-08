@@ -10,6 +10,8 @@ import yaml
 from looped_moe_gpt2.model.config import (
     AttentionConfig,
     LoopConfig,
+    MambaConfig,
+    MixerType,
     ModelConfig,
     MoEConfig,
     PositionEncodingType,
@@ -41,10 +43,13 @@ def load_model_config(yaml_path: Path) -> ModelConfig:
     attention_raw = model_raw.pop("attention", {})
     moe_raw = model_raw.pop("moe", {})
     loop_raw = model_raw.pop("loop", {})
+    mamba_raw = model_raw.pop("mamba", None)
     router_raw = loop_raw.pop("router", None)
 
     if "position_encoding" in model_raw:
         model_raw["position_encoding"] = PositionEncodingType(model_raw["position_encoding"])
+    if "mixer_type" in model_raw:
+        model_raw["mixer_type"] = MixerType(model_raw["mixer_type"])
     if "sharing_pattern" in loop_raw:
         loop_raw["sharing_pattern"] = SharingPattern(loop_raw["sharing_pattern"])
     if router_raw is not None:
@@ -54,6 +59,7 @@ def load_model_config(yaml_path: Path) -> ModelConfig:
         attention=AttentionConfig(**attention_raw),
         moe=MoEConfig(**moe_raw),
         loop=LoopConfig(**loop_raw),
+        mamba=MambaConfig(**mamba_raw) if mamba_raw is not None else None,
         **model_raw,
     )
 

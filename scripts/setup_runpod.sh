@@ -48,6 +48,26 @@ echo "--- Installing looped-moe-gpt2 in editable mode ---"
 pip install --quiet --upgrade pip
 pip install --quiet -e .
 
+echo "--- Installing Mamba-2 dependencies (mamba_ssm, causal-conv1d) ---"
+echo "This compiles CUDA kernels from source -- expect several minutes. See"
+echo "docs/mamba_investigation.md for the version pins and why they matter:"
+echo "mamba-ssm 2.3.x pulls in a heavy TileLang/TVM/CUDA-13 stack that would"
+echo "upgrade torch itself; causal-conv1d 1.4.0's PyPI sdist is missing its"
+echo "own CUDA sources, so it must come from the git tag instead."
+pip install --quiet 'transformers==4.44.2'
+pip install --quiet 'mamba-ssm==2.2.4'
+MAX_JOBS=4 pip install --quiet \
+    'causal-conv1d @ git+https://github.com/Dao-AILab/causal-conv1d.git@v1.4.0' \
+    --no-build-isolation
+python3 -c "
+from mamba_ssm import Mamba2
+import torch
+x = torch.randn(2, 64, 256, device='cuda')
+m = Mamba2(d_model=256, d_state=64, d_conv=4, expand=2, headdim=64).cuda()
+y = m(x)
+print(f'mamba_ssm smoke test passed: output shape {tuple(y.shape)}')
+"
+
 echo "--- Verifying torch sees the GPU ---"
 python3 -c "
 import torch
@@ -77,6 +97,6 @@ pytest tests/ -q
 
 echo ""
 echo "=== Setup complete ==="
-echo "Next: run scripts/prepare_curriculum_data.py to generate training data, then"
-echo "      scripts/profile_h100_batch_size.py to find the right batch size for this GPU,"
-echo "      then scripts/train.py to launch training."
+echo "Next: run scripts/prepare_data.py (or prepare_curriculum_data.py) to generate training"
+echo "      data, then scripts/profile_batch_size.py --config <your config>.yaml to find the"
+echo "      right batch size for THIS GPU, then scripts/train.py to launch training."

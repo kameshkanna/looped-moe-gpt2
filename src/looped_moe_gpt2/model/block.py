@@ -15,7 +15,14 @@ import torch
 from torch import nn
 
 from looped_moe_gpt2.model.attention import build_attention_module
-from looped_moe_gpt2.model.config import AttentionConfig, MoEConfig, PositionEncodingType
+from looped_moe_gpt2.model.config import (
+    AttentionConfig,
+    MambaConfig,
+    MixerType,
+    MoEConfig,
+    PositionEncodingType,
+)
+from looped_moe_gpt2.model.mamba_mixer import Mamba2Mixer
 from looped_moe_gpt2.model.moe import SparseMoE
 from looped_moe_gpt2.model.normalization import IterAdaLN
 
@@ -49,7 +56,7 @@ class DenseFeedForward(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    """Pre-norm transformer block with MLA/MHA attention and MoE/dense feed-forward.
+    """Pre-norm transformer block with attention and/or Mamba-2 mixing, and MoE/dense FFN.
 
     Args:
         hidden_size: Model (residual stream) width.
@@ -64,6 +71,11 @@ class TransformerBlock(nn.Module):
             passed to :meth:`forward`) instead of standard LayerNorm.
         max_iterations: Required if ``use_iter_adaln`` is True; sizes IterAdaLN's embedding
             table.
+        mixer_type: Which sequence-mixing mechanism(s) this block uses; see :class:`MixerType`.
+            Defaults to attention-only, preserving all pre-existing behavior.
+        mamba_config: Required (and only meaningful) when ``mixer_type`` is
+            ``MixerType.MAMBA2`` or ``MixerType.HYBRID_MAMBA_ATTENTION``; see
+            :class:`~looped_moe_gpt2.model.config.MambaConfig`.
     """
 
     def __init__(
@@ -77,26 +89,48 @@ class TransformerBlock(nn.Module):
         dropout: float = 0.1,
         use_iter_adaln: bool = False,
         max_iterations: Optional[int] = None,
+        mixer_type: MixerType = MixerType.ATTENTION,
+        mamba_config: Optional[MambaConfig] = None,
     ) -> None:
         super().__init__()
         self.use_iter_adaln = use_iter_adaln
+        self.mixer_type = mixer_type
+        self.use_mamba = mixer_type in (MixerType.MAMBA2, MixerType.HYBRID_MAMBA_ATTENTION)
+        self.use_attention = mixer_type in (MixerType.ATTENTION, MixerType.HYBRID_MAMBA_ATTENTION)
 
-        if use_iter_adaln:
-            if max_iterations is None:
-                raise ValueError("max_iterations must be provided when use_iter_adaln=True.")
-            self.norm1: Union[IterAdaLN, nn.LayerNorm] = IterAdaLN(hidden_size, max_iterations)
-            self.norm2: Union[IterAdaLN, nn.LayerNorm] = IterAdaLN(hidden_size, max_iterations)
+        def make_norm() -> Union[IterAdaLN, nn.LayerNorm]:
+            if use_iter_adaln:
+                if max_iterations is None:
+                    raise ValueError("max_iterations must be provided when use_iter_adaln=True.")
+                return IterAdaLN(hidden_size, max_iterations)
+            return nn.LayerNorm(hidden_size)
+
+        self.norm1: Union[IterAdaLN, nn.LayerNorm] = make_norm()
+        self.norm2: Union[IterAdaLN, nn.LayerNorm] = make_norm()
+        # A hybrid block runs Mamba-2 first, then attention, each with its own pre-norm and
+        # residual add -- norm_mamba is only constructed (and only used) in the hybrid case.
+        self.norm_mamba: Optional[Union[IterAdaLN, nn.LayerNorm]] = (
+            make_norm() if mixer_type == MixerType.HYBRID_MAMBA_ATTENTION else None
+        )
+
+        if self.use_mamba:
+            if mamba_config is None:
+                raise ValueError(f"mamba_config must be provided when mixer_type={mixer_type.value!r}.")
+            self.mamba: Optional[Mamba2Mixer] = Mamba2Mixer(hidden_size, mamba_config, dropout)
         else:
-            self.norm1 = nn.LayerNorm(hidden_size)
-            self.norm2 = nn.LayerNorm(hidden_size)
+            self.mamba = None
 
-        self.attention = build_attention_module(
-            hidden_size=hidden_size,
-            num_heads=num_heads,
-            attention_config=attention_config,
-            position_encoding=position_encoding,
-            max_seq_len=max_seq_len,
-            dropout=dropout,
+        self.attention: Optional[nn.Module] = (
+            build_attention_module(
+                hidden_size=hidden_size,
+                num_heads=num_heads,
+                attention_config=attention_config,
+                position_encoding=position_encoding,
+                max_seq_len=max_seq_len,
+                dropout=dropout,
+            )
+            if self.use_attention
+            else None
         )
 
         self.moe_enabled = moe_config.enabled
@@ -109,6 +143,12 @@ class TransformerBlock(nn.Module):
     def forward(self, x: torch.Tensor, iteration_idx: Optional[int] = None) -> torch.Tensor:
         """Apply one transformer block pass.
 
+        For ``MixerType.HYBRID_MAMBA_ATTENTION``, the Mamba-2 mixer and attention are applied
+        as two separate pre-norm sub-blocks, in that order (Mamba-2 first), each with its own
+        residual connection, before the feed-forward sub-block -- i.e. the block becomes
+        (norm, mamba, residual) -> (norm, attention, residual) -> (norm, ffn, residual) rather
+        than the standard two-sub-block (attention, ffn) structure.
+
         Args:
             x: Input tensor of shape ``(batch, seq_len, hidden_size)``.
             iteration_idx: Current loop iteration (0-indexed). Required if this block was
@@ -120,14 +160,32 @@ class TransformerBlock(nn.Module):
         Raises:
             ValueError: If ``use_iter_adaln=True`` but ``iteration_idx`` is not provided.
         """
-        if self.use_iter_adaln:
-            if iteration_idx is None:
-                raise ValueError("iteration_idx is required when use_iter_adaln=True.")
-            x = x + self.attention(self.norm1(x, iteration_idx))
-            x = x + self.feed_forward(self.norm2(x, iteration_idx))
+        if self.use_iter_adaln and iteration_idx is None:
+            raise ValueError("iteration_idx is required when use_iter_adaln=True.")
+
+        def norm1(t: torch.Tensor) -> torch.Tensor:
+            return self.norm1(t, iteration_idx) if self.use_iter_adaln else self.norm1(t)
+
+        def norm2(t: torch.Tensor) -> torch.Tensor:
+            return self.norm2(t, iteration_idx) if self.use_iter_adaln else self.norm2(t)
+
+        if self.mixer_type == MixerType.HYBRID_MAMBA_ATTENTION:
+            assert self.mamba is not None and self.attention is not None and self.norm_mamba is not None
+            norm_mamba = (
+                (lambda t: self.norm_mamba(t, iteration_idx))
+                if self.use_iter_adaln
+                else (lambda t: self.norm_mamba(t))
+            )
+            x = x + self.mamba(norm_mamba(x))
+            x = x + self.attention(norm1(x))
+        elif self.mixer_type == MixerType.MAMBA2:
+            assert self.mamba is not None
+            x = x + self.mamba(norm1(x))
         else:
-            x = x + self.attention(self.norm1(x))
-            x = x + self.feed_forward(self.norm2(x))
+            assert self.attention is not None
+            x = x + self.attention(norm1(x))
+
+        x = x + self.feed_forward(norm2(x))
         return x
 
     def expert_load(self) -> Optional[torch.Tensor]:

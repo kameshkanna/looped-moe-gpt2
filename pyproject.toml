@@ -16,6 +16,9 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "pytest-cov>=5.0", "ruff>=0.5"]
+# mamba-ssm and causal-conv1d compile CUDA kernels and are not reliably installable on native
+# Windows; install via WSL only. See docs/mamba_investigation.md.
+mamba = ["mamba-ssm==2.2.4", "causal-conv1d==1.4.0", "transformers==4.44.2"]
 
 [tool.ruff]
 line-length = 100

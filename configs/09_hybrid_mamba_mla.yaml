@@ -1,0 +1,74 @@
+# Variant 9: hybrid_mamba_mla
+#
+# Both a Mamba-2 mixer AND MLA attention inside the same shared, looped block (Mamba-2 first,
+# then attention, each with its own pre-norm and residual add), following a Jamba/Zamba-style
+# SSM+attention hybridization -- fused into one block position (rather than alternated across
+# separate positions) so that looping over the shared block still passes every token through
+# both mechanisms every iteration. See docs/mamba_investigation.md.
+#
+# 97.3M params, effective_depth=26 (same structure as configs/08 and configs/10). Compare
+# directly against configs/08_pure_mamba2.yaml (93.6M, no attention) and
+# configs/10_mla_baseline_comparison.yaml (80.6M, no Mamba) -- same hidden_size/num_layers/
+# num_loops/MoE config in all three, only the sequence mixer differs. Trimmed alongside
+# configs/08 (see that file's header for why) from an initial 640/2850-step pass.
+model:
+  vocab_size: 50257
+  hidden_size: 576
+  num_layers: 8
+  num_heads: 8
+  max_seq_len: 512
+  dropout: 0.1
+  position_encoding: decoupled_rope
+  tie_word_embeddings: true
+  seed: 1337
+  attention:
+    use_mla: true
+    kv_compression_dim: 64
+    q_compression_dim: 160
+    rope_head_dim: 32
+  mixer_type: hybrid_mamba_attention
+  mamba:
+    d_state: 64
+    d_conv: 4
+    expand: 2
+    headdim: 72
+    ngroups: 1
+  moe:
+    enabled: true
+    num_routed_experts: 8
+    num_shared_experts: 1
+    top_k: 2
+    expert_intermediate_size: 576
+    bias_update_speed: 1.0e-3
+    bias_update_speed_decay_frac: 0.1
+  loop:
+    enabled: true
+    sharing_pattern: middle_cycle
+    num_loops: 4
+    num_unique_prefix_layers: 1
+    num_unique_suffix_layers: 1
+    use_iter_adaln: true
+    use_active_ratio_balancing: true
+    use_router_gating: false
+
+train:
+  train_bin_path: data/general_train.bin
+  val_bin_path: data/general_val.bin
+  output_dir: runs/09_hybrid_mamba_mla
+  batch_size: 4
+  gradient_accumulation_steps: 8
+  max_steps: 2200
+  learning_rate: 3.0e-4
+  min_learning_rate: 3.0e-5
+  warmup_steps: 22
+  weight_decay: 0.1
+  beta1: 0.9
+  beta2: 0.95
+  grad_clip_norm: 1.0
+  eval_interval: 55
+  eval_iters: 30
+  log_interval: 100
+  checkpoint_interval: 55
+  use_amp: true
+  seed: 1337
+  compile_model: false

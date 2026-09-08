@@ -3,6 +3,8 @@
 from looped_moe_gpt2.model.config import (
     AttentionConfig,
     LoopConfig,
+    MambaConfig,
+    MixerType,
     ModelConfig,
     MoEConfig,
     PositionEncodingType,
@@ -13,6 +15,8 @@ from looped_moe_gpt2.model.gpt import LoopedMoEGPT
 __all__ = [
     "AttentionConfig",
     "LoopConfig",
+    "MambaConfig",
+    "MixerType",
     "ModelConfig",
     "MoEConfig",
     "PositionEncodingType",

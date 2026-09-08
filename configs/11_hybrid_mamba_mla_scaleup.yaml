@@ -1,0 +1,103 @@
+# Variant 11: hybrid_mamba_mla_scaleup
+#
+# Full-scale H100 pretraining run of the winning architecture from the local diagnostic
+# comparison (configs/09_hybrid_mamba_mla.yaml beat both pure-Mamba (08) and MLA-only (10) on
+# validation loss/perplexity at ~36M tokens). This config scales that same architecture up to
+# 158.4M params, at Chinchilla-optimal token count (20x params), for a genuinely well-trained
+# BASE model -- see the note below on why this is not yet a chat model.
+#
+# 158.4M params, effective_depth=26. max_seq_len=2048 (4x the diagnostic runs' 512) for
+# meaningfully longer context -- Mamba-2's recurrent state doesn't grow with sequence length,
+# so long context is comparatively cheap for the SSM half of this hybrid block; only the MLA
+# attention sub-layer's O(seq^2) term grows with context, and MLA's compressed KV keeps that
+# growth cheaper than standard multi-head attention would be at the same length.
+#
+# IMPORTANT -- this is a BASE model, not a chat model. Base pretraining on raw next-token
+# prediction over general web text (however many tokens) does not by itself produce
+# instruction-following/chat behavior -- that requires a separate supervised fine-tuning (SFT)
+# stage on instruction/response data AFTER this run completes. See docs/mamba_investigation.md
+# for the planned SFT follow-up. Do not expect chat-model behavior from this checkpoint alone.
+#
+# Token budget: 3.17B tokens (20 * 158.4M params, Chinchilla-optimal).
+#
+# GPU choice: A100 SXM ($1.59/hr), not H100/H200/B200/B300, chosen deliberately -- this model
+# (158.4M params) does not need 80GB+ VRAM, mamba_ssm's kernels were originally developed and
+# benchmarked on A100 (mature, well-tested support; A100 is sm_80, already covered by
+# causal-conv1d/mamba_ssm's compiled -gencode architecture list), and this project has no
+# multi-GPU (DDP/FSDP) training support yet, so a "max quantity" of any GPU type would be
+# wasted -- only a single card is actually used. Estimated total run cost: roughly $9-37
+# (5.7-23.6 hours) depending on actual measured throughput at max_seq_len=2048 -- profile on
+# the actual pod (step below) before trusting max_steps; the wide range reflects real
+# uncertainty in how compute- vs. bandwidth-bound this specific hybrid architecture is on A100,
+# not a rounding margin.
+#
+# batch_size/gradient_accumulation_steps/max_steps below are PLACEHOLDERS sized for a
+# conservative starting point (matching the diagnostic runs' effective batch of 32) -- run
+# scripts/profile_batch_size.py on the actual H100 pod FIRST (see docs/runpod_h100_setup.md
+# §3) and recompute max_steps for the real batch size found:
+#   new_max_steps = 3_170_000_000 // (new_batch_size * new_gradient_accumulation_steps * 2048)
+# Also rescale warmup_steps (~1%), eval_interval (~2.5%), and checkpoint_interval (~10%, per
+# this run's explicit "checkpoint every 10% of training" choice) proportionally to the
+# recomputed max_steps.
+model:
+  vocab_size: 50257
+  hidden_size: 768
+  num_layers: 8
+  num_heads: 12
+  max_seq_len: 2048
+  dropout: 0.1
+  position_encoding: decoupled_rope
+  tie_word_embeddings: true
+  seed: 1337
+  attention:
+    use_mla: true
+    kv_compression_dim: 64
+    q_compression_dim: 160
+    rope_head_dim: 32
+  mixer_type: hybrid_mamba_attention
+  mamba:
+    d_state: 64
+    d_conv: 4
+    expand: 2
+    headdim: 64
+    ngroups: 1
+  moe:
+    enabled: true
+    num_routed_experts: 8
+    num_shared_experts: 1
+    top_k: 2
+    expert_intermediate_size: 768
+    bias_update_speed: 1.0e-3
+    bias_update_speed_decay_frac: 0.1
+  loop:
+    enabled: true
+    sharing_pattern: middle_cycle
+    num_loops: 4
+    num_unique_prefix_layers: 1
+    num_unique_suffix_layers: 1
+    use_iter_adaln: true
+    use_active_ratio_balancing: true
+    use_router_gating: false
+
+train:
+  train_bin_path: data/general_3b_train.bin
+  val_bin_path: data/general_3b_val.bin
+  output_dir: runs/11_hybrid_mamba_mla_scaleup
+  # PLACEHOLDER -- see the header note above. Re-profile and recompute before launching.
+  batch_size: 8
+  gradient_accumulation_steps: 4
+  max_steps: 48370   # 3.17B tokens // (8 * 4 * 2048) at the placeholder batch size above
+  learning_rate: 3.0e-4
+  min_learning_rate: 3.0e-5
+  warmup_steps: 484   # ~1% of max_steps
+  weight_decay: 0.1
+  beta1: 0.9
+  beta2: 0.95
+  grad_clip_norm: 1.0
+  eval_interval: 1209   # ~2.5% of max_steps
+  eval_iters: 50
+  log_interval: 500
+  checkpoint_interval: 4837   # ~10% of max_steps -- 10 checkpoints total across the run
+  use_amp: true
+  seed: 1337
+  compile_model: false   # left off for the Mamba mixer's Triton kernels; see docs/mamba_investigation.md

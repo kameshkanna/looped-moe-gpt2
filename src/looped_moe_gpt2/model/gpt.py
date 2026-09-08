@@ -180,6 +180,8 @@ class LoopedMoEGPT(nn.Module):
             dropout=config.dropout,
             use_iter_adaln=use_iter_adaln,
             max_iterations=max_iterations,
+            mixer_type=config.mixer_type,
+            mamba_config=config.mamba,
         )
 
     @staticmethod
