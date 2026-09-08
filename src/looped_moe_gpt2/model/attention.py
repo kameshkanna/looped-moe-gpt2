@@ -75,8 +75,7 @@ class MultiHeadLatentAttention(nn.Module):
         self.attn_dropout = nn.Dropout(dropout)
         self.resid_dropout = nn.Dropout(dropout)
 
-        causal_mask = torch.tril(torch.ones(max_seq_len, max_seq_len, dtype=torch.bool))
-        self.register_buffer("causal_mask", causal_mask, persistent=False)
+        self.max_seq_len = max_seq_len
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Compute causal MLA self-attention.
@@ -88,13 +87,13 @@ class MultiHeadLatentAttention(nn.Module):
             Output tensor of shape ``(batch, seq_len, hidden_size)``.
 
         Raises:
-            ValueError: If ``x``'s sequence length exceeds the precomputed causal mask size.
+            ValueError: If ``x``'s sequence length exceeds ``max_seq_len``.
         """
         batch_size, seq_len, _ = x.shape
-        if seq_len > self.causal_mask.shape[0]:
+        if seq_len > self.max_seq_len:
             raise ValueError(
-                f"Sequence length ({seq_len}) exceeds max_seq_len used to build the causal "
-                f"mask ({self.causal_mask.shape[0]})."
+                f"Sequence length ({seq_len}) exceeds max_seq_len used to configure this "
+                f"attention module ({self.max_seq_len})."
             )
 
         cos, sin = build_rope_cache(
@@ -127,14 +126,19 @@ class MultiHeadLatentAttention(nn.Module):
         k = torch.cat([k_nope, k_rope], dim=-1)  # (B, H, T, head_dim)
         q = torch.cat([q_nope, q_rope], dim=-1)  # (B, H, T, head_dim)
 
-        attn_mask = self.causal_mask[:seq_len, :seq_len]
         out = torch.nn.functional.scaled_dot_product_attention(
             q,
             k,
             v,
-            attn_mask=attn_mask,
             dropout_p=self.dropout_p if self.training else 0.0,
-            is_causal=False,  # explicit mask already encodes causality
+            # is_causal=True (rather than an explicit boolean attn_mask tensor) lets SDPA
+            # dispatch to the Flash Attention / memory-efficient backend, which never
+            # materializes a full (B, H, T, T) score matrix -- an explicit mask tensor, even
+            # one that is purely causal with no padding, forces a fallback to the much more
+            # memory-hungry "math" backend on many PyTorch versions. Confirmed empirically: at
+            # seq_len=2048 this was responsible for ~50GB of otherwise-unexplained activation
+            # memory (see docs/mamba_investigation.md's H100/A100 profiling section).
+            is_causal=True,
         )  # (B, H, T, nope_head_dim) -- value dim is nope_head_dim, not head_dim
 
         out = out.transpose(1, 2).contiguous().view(batch_size, seq_len, self.num_heads * self.nope_head_dim)
@@ -179,9 +183,7 @@ class StandardMultiHeadAttention(nn.Module):
         self.out_proj = nn.Linear(hidden_size, hidden_size, bias=False)
         self.attn_dropout = nn.Dropout(dropout)
         self.resid_dropout = nn.Dropout(dropout)
-
-        causal_mask = torch.tril(torch.ones(max_seq_len, max_seq_len, dtype=torch.bool))
-        self.register_buffer("causal_mask", causal_mask, persistent=False)
+        self.max_seq_len = max_seq_len
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Compute causal self-attention.
@@ -191,8 +193,16 @@ class StandardMultiHeadAttention(nn.Module):
 
         Returns:
             Output tensor of shape ``(batch, seq_len, hidden_size)``.
+
+        Raises:
+            ValueError: If ``x``'s sequence length exceeds ``max_seq_len``.
         """
         batch_size, seq_len, hidden_size = x.shape
+        if seq_len > self.max_seq_len:
+            raise ValueError(
+                f"Sequence length ({seq_len}) exceeds max_seq_len used to configure this "
+                f"attention module ({self.max_seq_len})."
+            )
         qkv = self.qkv_proj(x).view(batch_size, seq_len, 3, self.num_heads, self.head_dim)
         q, k, v = qkv.permute(2, 0, 3, 1, 4).unbind(dim=0)  # each (B, H, T, head_dim)
 
@@ -207,10 +217,10 @@ class StandardMultiHeadAttention(nn.Module):
             q = apply_rope(q, cos, sin)
             k = apply_rope(k, cos, sin)
 
-        attn_mask = self.causal_mask[:seq_len, :seq_len]
         out = torch.nn.functional.scaled_dot_product_attention(
-            q, k, v, attn_mask=attn_mask, dropout_p=self.dropout_p if self.training else 0.0
-        )
+            q, k, v, dropout_p=self.dropout_p if self.training else 0.0, is_causal=True
+        )  # is_causal=True (not an explicit mask tensor) enables the memory-efficient SDPA
+        # backend -- see MultiHeadLatentAttention.forward's comment for the measured impact.
         out = out.transpose(1, 2).contiguous().view(batch_size, seq_len, hidden_size)
         return self.resid_dropout(self.out_proj(out))
 
