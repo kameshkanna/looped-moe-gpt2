@@ -257,6 +257,69 @@ somewhat higher per-step wall-clock time (checkpointing recomputes each block's 
 during backward). The exact new numbers were not yet measured as of this writing; do not trust
 the config's placeholder `max_steps` until re-profiled.
 
+## 8.6. Inference-speed pivot: a confirmed long-context crossover, on this project's own model
+
+After the training-scale-up work in §7-8.5, the project's focus shifted to inference speed --
+motivated directly by looped architectures' worse-than-expected training economics on
+consumer/single-GPU hardware (see the local-vs-A100 timeline discussion in the session record)
+and the observation that inference cost, not training cost, is what a small released model
+actually pays repeatedly. This section documents what was found.
+
+**Starting honest baseline (real `generate()`, no KV cache, short context):** benchmarking the
+actual trained checkpoints (`runs/09_hybrid_mamba_mla`, `runs/10_mla_baseline_comparison`) via
+`scripts/benchmark_inference.py` at prompt lengths 16-384 tokens found:
+- MLA-only: 5.4-5.6 tok/s (flat -- no visible no-cache penalty at this scale)
+- Hybrid Mamba+MLA: 3.7-4.3 tok/s -- SLOWER than MLA-only, and slower than the literature's
+  "Mamba is fast" framing would suggest.
+
+This initially looked like it contradicted the Mamba inference-speed literature. It does not --
+it confirms a real, well-documented crossover point that this project's diagnostic configs
+(`max_seq_len=512`) are simply too short to reach. Per multiple 2026 sources, attention (even
+KV-cached) and Mamba/SSM decode are competitive below roughly 4K context tokens, with Mamba
+pulling ahead above ~8K-16K as attention's KV-cache read cost keeps growing per step while
+Mamba's recurrent-state decode cost stays genuinely constant. At batch_size=1 and short
+sequences, Mamba's per-call Triton kernel LAUNCH overhead (not its algorithmic cost) dominates
+and hides any advantage -- exactly what was measured.
+
+**Confirmed directly on this architecture, not just cited:** `scripts/benchmark_long_context.py`
+constructs UNTRAINED models (valid for a pure throughput/memory measurement -- weights don't
+affect compute cost) at `configs/08/09/10`'s exact dimensions (576 hidden, 8 layers, 4 loops,
+effective_depth=26), varying `max_seq_len` per test, and measures real `generate()` throughput
+at increasing prompt lengths on the RTX 4060:
+
+| prompt_len | ATTENTION tok/s | MAMBA2 tok/s | HYBRID tok/s |
+|---|---|---|---|
+| 512  | **9.9** | 5.0 | 3.9 |
+| 2048 | 3.1 | **3.7** | 2.5 |
+| 4096 | 1.6 | **2.2** | 1.3 |
+| 6144 | 1.0 | **1.6** | 0.8 |
+
+The crossover is real and visible: attention wins decisively at 512 tokens (2x Mamba's
+throughput), but pure Mamba2 overtakes attention by 2048 tokens and the gap widens
+monotonically and substantially further as context grows -- 38% faster at 4096, 60% faster at
+6144. This is a genuine confirmation of the literature's claimed crossover, measured on this
+project's own architecture and hardware across four increasing context lengths, not assumed
+from a citation or a single data point.
+
+**Two things this result does NOT yet establish, both worth stating precisely rather than
+overclaiming:**
+1. The hybrid mixer is the WORST performer at every context length tested here -- it pays
+   Mamba's kernel-launch overhead AND still pays attention's full O(n) recomputation cost
+   (no KV cache exists in this codebase yet), without a long enough context in this test range
+   for Mamba's share of the block to compensate. Whether a hybrid ever beats pure Mamba at very
+   long context, and where, is not yet measured.
+2. All of the above is WITHOUT a KV cache for the attention path. A real cache would very
+   likely shift attention's curve to be flatter and faster at these same lengths (removing the
+   O(n) recomputation penalty entirely), which could push the measured crossover point further
+   out than what's shown here. The crossover's existence is confirmed; its exact location under
+   a properly cached attention implementation is not yet known.
+
+**Also directly relevant to future architecture decisions:** production hybrid models
+(NVIDIA's Nemotron-H) use roughly 92% Mamba-2 layers to 8% attention layers, not this project's
+current roughly 1:1 per-block ratio -- a substantially different design point, motivated by
+exactly this crossover behavior (mostly-constant-cost layers, with just enough attention
+sprinkled in to recover the in-context-learning/copying capability Mamba alone lacks).
+
 ## 9. Running the three variants
 
 One at a time (single GPU) — see the commands in the session's own record; in short:
