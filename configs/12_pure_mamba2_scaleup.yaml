@@ -1,0 +1,120 @@
+# Variant 12: pure_mamba2_scaleup
+#
+# Full-scale multi-GPU-cluster pretraining run of the BEST-BALANCED architecture across all
+# evidence gathered so far, not the single best-on-one-axis architecture. Recap of the two
+# separate comparisons that motivate this choice (see docs/mamba_investigation.md §8-8.6):
+#
+#   QUALITY (val loss/perplexity, ~36M tokens, matched ~80-97M params):
+#     configs/09 hybrid_mamba_mla: val_loss=5.4895, val_ppl=242.1  (best)
+#     configs/08 pure_mamba2:      val_loss=5.5851, val_ppl=266.4  (2nd, 1.6% worse)
+#     configs/10 mla_baseline:     val_loss=5.5279, val_ppl=251.6  (middle)
+#
+#   INFERENCE SPEED (tok/s, untrained-model timing sweep, matched dims, RTX 4060):
+#     prompt_len=512:   attention=9.9 (best)  mamba2=5.0            hybrid=3.9
+#     prompt_len=2048:  attention=3.1          mamba2=3.7 (best)    hybrid=2.5
+#     prompt_len=4096:  attention=1.6          mamba2=2.2 (best,+38%) hybrid=1.3
+#     prompt_len=6144:  attention=1.0          mamba2=1.6 (best,+60%) hybrid=0.8
+#
+# The hybrid (configs/09/11) is best on quality but WORST on speed at every context length
+# tested -- it pays Mamba's kernel-launch overhead AND attention's full O(n) recomputation cost
+# without a long enough context in the tested range for Mamba's share to compensate.
+# MLA-only (configs/10) only wins speed below ~2048 tokens, then loses by a growing margin.
+# Pure Mamba2 (this config) is the pick: only 1.6% worse validation quality than the hybrid at
+# diagnostic scale (a gap likely within noise for a single 36M-token run, and one a real
+# Chinchilla-scale run may close or reverse), while being the clear inference-speed winner at
+# any context beyond ~2K tokens, with a lead that grows monotonically with context length.
+#
+# 153.1M params, effective_depth=26. max_seq_len=4096 (2x configs/11's 2048) -- pushed further
+# now that a multi-GPU cluster (2x RTX 6000, 96GB each) removes the VRAM ceiling that
+# constrained configs/11's A100 profiling, and because the confirmed inference-speed advantage
+# specifically grows with context length, so training at longer context is directly aligned
+# with this architecture's actual strength rather than an arbitrary choice.
+#
+# No attention path at all (mixer_type: mamba2, position_encoding: none) -- Mamba-2's own
+# recurrence is position-sensitive without any explicit positional encoding; see ModelConfig's
+# validation, which requires this pairing.
+#
+# IMPORTANT -- this is a BASE model, not a chat model; see configs/11's header note (same
+# caveat applies unchanged) for why base pretraining alone does not produce chat behavior.
+#
+# Token budget: 3.06B tokens (20 * 153.1M params, Chinchilla-optimal).
+#
+# GPU choice: 2x RTX 6000 96GB from a university cluster resource -- single-GPU use for THIS
+# run (this codebase has no multi-GPU/DDP training support yet, see docs/mamba_investigation.md
+# for the open question of whether to build that next), but 96GB per card removes the VRAM
+# ceiling entirely at this model/context scale, allowing a much larger batch size than the
+# A100's 80GB-constrained profiling found for configs/11's hybrid architecture at half this
+# context length.
+#
+# batch_size/gradient_accumulation_steps/max_steps below are PLACEHOLDERS -- run
+# scripts/profile_batch_size.py on the ACTUAL cluster node FIRST (see docs/runpod_h100_setup.md
+# §3 for the profiling workflow; adapt for the university cluster's own environment/scheduler)
+# and recompute max_steps for the real batch size found:
+#   new_max_steps = 3_060_000_000 // (new_batch_size * new_gradient_accumulation_steps * 4096)
+# Also rescale warmup_steps (~1%), eval_interval (~2.5%), and checkpoint_interval (~10%)
+# proportionally to the recomputed max_steps.
+#
+# use_gradient_checkpointing: true kept on by default -- even with 96GB available, this is a
+# real, verified-correct (see tests/test_model.py's numerical-equivalence test), essentially
+# free way to buy a much larger usable batch size at effective_depth=26; only worth disabling
+# if profiling shows the recompute cost isn't worth it at this GPU's compute/memory ratio.
+model:
+  vocab_size: 50257
+  hidden_size: 768
+  num_layers: 8
+  num_heads: 12
+  max_seq_len: 4096
+  dropout: 0.1
+  position_encoding: none
+  tie_word_embeddings: true
+  use_gradient_checkpointing: true
+  seed: 1337
+  attention:
+    use_mla: false
+  mixer_type: mamba2
+  mamba:
+    d_state: 64
+    d_conv: 4
+    expand: 2
+    headdim: 64
+    ngroups: 1
+  moe:
+    enabled: true
+    num_routed_experts: 8
+    num_shared_experts: 1
+    top_k: 2
+    expert_intermediate_size: 768
+    bias_update_speed: 1.0e-3
+    bias_update_speed_decay_frac: 0.1
+  loop:
+    enabled: true
+    sharing_pattern: middle_cycle
+    num_loops: 4
+    num_unique_prefix_layers: 1
+    num_unique_suffix_layers: 1
+    use_iter_adaln: true
+    use_active_ratio_balancing: true
+    use_router_gating: false
+
+train:
+  train_bin_path: data/general_3b_train.bin
+  val_bin_path: data/general_3b_val.bin
+  output_dir: runs/12_pure_mamba2_scaleup
+  # PLACEHOLDER -- see the header note above. Re-profile and recompute before launching.
+  batch_size: 16
+  gradient_accumulation_steps: 4
+  max_steps: 11672   # 3.06B tokens // (16 * 4 * 4096) at the placeholder batch size above
+  learning_rate: 3.0e-4
+  min_learning_rate: 3.0e-5
+  warmup_steps: 117   # ~1% of max_steps
+  weight_decay: 0.1
+  beta1: 0.9
+  beta2: 0.95
+  grad_clip_norm: 1.0
+  eval_interval: 292   # ~2.5% of max_steps
+  eval_iters: 50
+  log_interval: 100
+  checkpoint_interval: 1167   # ~10% of max_steps -- 10 checkpoints total across the run
+  use_amp: true
+  seed: 1337
+  compile_model: false   # left off for the Mamba mixer's Triton kernels; see docs/mamba_investigation.md

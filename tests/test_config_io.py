@@ -23,6 +23,7 @@ ALL_CONFIG_NAMES = [
     "09_hybrid_mamba_mla.yaml",
     "10_mla_baseline_comparison.yaml",
     "11_hybrid_mamba_mla_scaleup.yaml",
+    "12_pure_mamba2_scaleup.yaml",
 ]
 
 
